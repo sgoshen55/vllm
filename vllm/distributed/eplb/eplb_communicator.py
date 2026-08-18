@@ -5,11 +5,14 @@ EPLB communicator implementations and factory.
 """
 
 import contextlib
+import struct
 import time
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import timedelta
+from enum import Enum, IntEnum
 
 import numpy as np
 import torch
@@ -35,6 +38,359 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+_NIXL_EPLB_NOTIFICATION_MAGIC = b"EPLB"
+_NIXL_EPLB_NOTIFICATION_VERSION = 1
+_NIXL_EPLB_NOTIFICATION_STRUCT = struct.Struct("!4sBBQIIIII")
+_NIXL_EPLB_DEFAULT_TIMEOUT_SECONDS = 300.0
+
+
+class _NixlEplbNotificationKind(IntEnum):
+    READY = 1
+    READ_DONE = 2
+
+
+class _NixlEplbNotificationDisposition(Enum):
+    RECORDED = "recorded"
+    DUPLICATE = "duplicate"
+    STALE = "stale"
+
+
+class _NixlEplbDeadlinePhase(Enum):
+    CUDA_READINESS = "CUDA readiness"
+    READY = "missing READY"
+    READ = "local READ completion"
+    READ_DONE = "missing READ_DONE"
+
+
+@dataclass(frozen=True, slots=True)
+class _NixlEplbSourceKey:
+    generation: int
+    layer: int
+    expert: int
+    source: int
+    tensor_group: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _NixlEplbTransferKey:
+    generation: int
+    layer: int
+    expert: int
+    source: int
+    reader: int
+    tensor_group: int = 0
+
+    @property
+    def source_key(self) -> _NixlEplbSourceKey:
+        return _NixlEplbSourceKey(
+            generation=self.generation,
+            layer=self.layer,
+            expert=self.expert,
+            source=self.source,
+            tensor_group=self.tensor_group,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _NixlEplbNotification:
+    kind: _NixlEplbNotificationKind
+    key: _NixlEplbTransferKey
+
+    def encode(self) -> bytes:
+        values = {
+            "generation": (self.key.generation, (1 << 64) - 1),
+            "layer": (self.key.layer, (1 << 32) - 1),
+            "expert": (self.key.expert, (1 << 32) - 1),
+            "source": (self.key.source, (1 << 32) - 1),
+            "reader": (self.key.reader, (1 << 32) - 1),
+            "tensor_group": (self.key.tensor_group, (1 << 32) - 1),
+        }
+        for name, (value, maximum) in values.items():
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"NIXL EPLB {name} must be an integer")
+            if not 0 <= value <= maximum:
+                raise ValueError(
+                    f"NIXL EPLB {name} must be between 0 and {maximum}, got {value}"
+                )
+        if not isinstance(self.kind, _NixlEplbNotificationKind):
+            raise ValueError(f"Invalid NIXL EPLB notification kind: {self.kind!r}")
+        return _NIXL_EPLB_NOTIFICATION_STRUCT.pack(
+            _NIXL_EPLB_NOTIFICATION_MAGIC,
+            _NIXL_EPLB_NOTIFICATION_VERSION,
+            self.kind,
+            self.key.generation,
+            self.key.layer,
+            self.key.expert,
+            self.key.source,
+            self.key.reader,
+            self.key.tensor_group,
+        )
+
+    @classmethod
+    def decode(cls, payload: bytes) -> "_NixlEplbNotification":
+        if len(payload) != _NIXL_EPLB_NOTIFICATION_STRUCT.size:
+            raise ValueError(
+                "Invalid NIXL EPLB notification length: "
+                f"expected {_NIXL_EPLB_NOTIFICATION_STRUCT.size}, got {len(payload)}"
+            )
+        (
+            magic,
+            version,
+            kind_value,
+            generation,
+            layer,
+            expert,
+            source,
+            reader,
+            tensor_group,
+        ) = _NIXL_EPLB_NOTIFICATION_STRUCT.unpack(payload)
+        if magic != _NIXL_EPLB_NOTIFICATION_MAGIC:
+            raise ValueError(f"Invalid NIXL EPLB notification magic: {magic!r}")
+        if version != _NIXL_EPLB_NOTIFICATION_VERSION:
+            raise ValueError(
+                "Unsupported NIXL EPLB notification version: "
+                f"expected {_NIXL_EPLB_NOTIFICATION_VERSION}, got {version}"
+            )
+        try:
+            kind = _NixlEplbNotificationKind(kind_value)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid NIXL EPLB notification kind: {kind_value}"
+            ) from exc
+        return cls(
+            kind=kind,
+            key=_NixlEplbTransferKey(
+                generation=generation,
+                layer=layer,
+                expert=expert,
+                source=source,
+                reader=reader,
+                tensor_group=tensor_group,
+            ),
+        )
+
+    def validate_route(self, sender_rank: int, receiver_rank: int) -> None:
+        if self.kind == _NixlEplbNotificationKind.READY:
+            expected_sender = self.key.source
+            expected_receiver = self.key.reader
+        elif self.kind == _NixlEplbNotificationKind.READ_DONE:
+            expected_sender = self.key.reader
+            expected_receiver = self.key.source
+        else:
+            raise RuntimeError(f"Invalid NIXL EPLB notification kind: {self.kind!r}")
+        if sender_rank != expected_sender or receiver_rank != expected_receiver:
+            raise RuntimeError(
+                "NIXL EPLB notification route mismatch: "
+                f"kind={self.kind.name}, sender={sender_rank}, "
+                f"expected_sender={expected_sender}, receiver={receiver_rank}, "
+                f"expected_receiver={expected_receiver}, key={self.key}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class _NixlEplbDeadline:
+    phase: _NixlEplbDeadlinePhase
+    key: _NixlEplbSourceKey | _NixlEplbTransferKey
+    expires_at: float
+
+
+class _NixlEplbProtocolState:
+    """Pure state for the synchronous notification protocol."""
+
+    def __init__(
+        self,
+        local_rank: int,
+        world_size: int,
+        timeout_seconds: float = _NIXL_EPLB_DEFAULT_TIMEOUT_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if not 0 <= local_rank < world_size:
+            raise ValueError(
+                f"local_rank must be in [0, {world_size}), got {local_rank}"
+            )
+        if timeout_seconds <= 0:
+            raise ValueError(f"timeout_seconds must be positive, got {timeout_seconds}")
+        self.local_rank = local_rank
+        self.world_size = world_size
+        self.timeout_seconds = timeout_seconds
+        self._clock = clock
+        self.active_generation: int | None = None
+        self.completed_generation = -1
+        self._expected_readers: dict[_NixlEplbSourceKey, frozenset[int]] = {}
+        self._completed_readers: dict[_NixlEplbSourceKey, set[int]] = {}
+        self._seen_ready: set[_NixlEplbTransferKey] = set()
+        self._ready_tokens: set[_NixlEplbTransferKey] = set()
+        self._deadlines: dict[
+            tuple[
+                _NixlEplbDeadlinePhase,
+                _NixlEplbSourceKey | _NixlEplbTransferKey,
+            ],
+            _NixlEplbDeadline,
+        ] = {}
+
+    def begin_generation(self, generation: int) -> None:
+        if self.active_generation is not None:
+            raise RuntimeError(
+                "NIXL EPLB synchronous generation overlap: "
+                f"active={self.active_generation}, requested={generation}"
+            )
+        if generation <= self.completed_generation:
+            raise RuntimeError(
+                "NIXL EPLB generation must advance past completed watermark: "
+                f"completed={self.completed_generation}, requested={generation}"
+            )
+        self.active_generation = generation
+
+    def end_generation(self, success: bool) -> None:
+        generation = self.active_generation
+        if generation is None:
+            raise RuntimeError("No active NIXL EPLB synchronous generation")
+        if success:
+            self.completed_generation = generation
+        self.active_generation = None
+        self._expected_readers = {
+            key: readers
+            for key, readers in self._expected_readers.items()
+            if key.generation > generation
+        }
+        self._completed_readers = {
+            key: readers
+            for key, readers in self._completed_readers.items()
+            if key.generation > generation
+        }
+        self._ready_tokens = {
+            key for key in self._ready_tokens if key.generation > generation
+        }
+        self._seen_ready = {
+            key for key in self._seen_ready if key.generation > generation
+        }
+        self._deadlines = {
+            deadline_key: deadline
+            for deadline_key, deadline in self._deadlines.items()
+            if deadline.key.generation > generation
+        }
+
+    def set_expected_readers(
+        self,
+        key: _NixlEplbSourceKey,
+        readers: Sequence[int],
+    ) -> bool:
+        self._require_active_generation(key.generation)
+        if key.source != self.local_rank:
+            raise RuntimeError(
+                "NIXL EPLB expected readers must be owned by the local source: "
+                f"local_rank={self.local_rank}, key={key}"
+            )
+        reader_set = frozenset(readers)
+        for reader in reader_set:
+            self._validate_rank(reader, "reader")
+            if reader == key.source:
+                raise RuntimeError(
+                    f"NIXL EPLB source cannot be its own remote reader: key={key}"
+                )
+        existing = self._expected_readers.get(key)
+        if existing is not None:
+            if existing != reader_set:
+                raise RuntimeError(
+                    "NIXL EPLB expected readers are already frozen: "
+                    f"key={key}, expected={sorted(existing)}, "
+                    f"requested={sorted(reader_set)}"
+                )
+            return False
+        self._expected_readers[key] = reader_set
+        self._completed_readers[key] = set()
+        return True
+
+    def expected_readers(self, key: _NixlEplbSourceKey) -> frozenset[int]:
+        return self._expected_readers[key]
+
+    def completed_readers(self, key: _NixlEplbSourceKey) -> frozenset[int]:
+        return frozenset(self._completed_readers[key])
+
+    def source_complete(self, key: _NixlEplbSourceKey) -> bool:
+        return self.expected_readers(key) == self.completed_readers(key)
+
+    def record_notification(
+        self,
+        notification: _NixlEplbNotification,
+        sender_rank: int,
+    ) -> _NixlEplbNotificationDisposition:
+        self._validate_rank(sender_rank, "sender")
+        notification.validate_route(sender_rank, self.local_rank)
+        generation = notification.key.generation
+        if generation <= self.completed_generation:
+            return _NixlEplbNotificationDisposition.STALE
+        self._require_active_generation(generation)
+        if notification.kind == _NixlEplbNotificationKind.READY:
+            if notification.key in self._seen_ready:
+                return _NixlEplbNotificationDisposition.DUPLICATE
+            self._seen_ready.add(notification.key)
+            self._ready_tokens.add(notification.key)
+            return _NixlEplbNotificationDisposition.RECORDED
+
+        source_key = notification.key.source_key
+        expected = self._expected_readers.get(source_key)
+        if expected is None or notification.key.reader not in expected:
+            raise RuntimeError(
+                "Unknown NIXL EPLB READ_DONE for active generation: "
+                f"key={notification.key}, expected={sorted(expected or ())}"
+            )
+        completed = self._completed_readers[source_key]
+        if notification.key.reader in completed:
+            return _NixlEplbNotificationDisposition.DUPLICATE
+        completed.add(notification.key.reader)
+        return _NixlEplbNotificationDisposition.RECORDED
+
+    def consume_ready(self, key: _NixlEplbTransferKey) -> bool:
+        self._require_active_generation(key.generation)
+        if key not in self._ready_tokens:
+            return False
+        self._ready_tokens.remove(key)
+        return True
+
+    def arm_deadline(
+        self,
+        phase: _NixlEplbDeadlinePhase,
+        key: _NixlEplbSourceKey | _NixlEplbTransferKey,
+    ) -> _NixlEplbDeadline:
+        self._require_active_generation(key.generation)
+        deadline = _NixlEplbDeadline(
+            phase=phase,
+            key=key,
+            expires_at=self._clock() + self.timeout_seconds,
+        )
+        self._deadlines[(phase, key)] = deadline
+        return deadline
+
+    def clear_deadline(
+        self,
+        phase: _NixlEplbDeadlinePhase,
+        key: _NixlEplbSourceKey | _NixlEplbTransferKey,
+    ) -> None:
+        self._deadlines.pop((phase, key), None)
+
+    def expired_deadlines(self) -> tuple[_NixlEplbDeadline, ...]:
+        now = self._clock()
+        return tuple(
+            deadline
+            for deadline in self._deadlines.values()
+            if now >= deadline.expires_at
+        )
+
+    def _require_active_generation(self, generation: int) -> None:
+        if generation != self.active_generation:
+            raise RuntimeError(
+                "NIXL EPLB notification generation mismatch: "
+                f"active={self.active_generation}, received={generation}"
+            )
+
+    def _validate_rank(self, rank: int, role: str) -> None:
+        if not 0 <= rank < self.world_size:
+            raise RuntimeError(
+                f"NIXL EPLB {role} rank is out of range: "
+                f"rank={rank}, world_size={self.world_size}"
+            )
 
 
 def has_nixl() -> bool:
@@ -309,10 +665,19 @@ class NixlEplbCommunicator(EplbCommunicator):
         # NIXL registration handles; deregistered in __del__.
         self._registered_descs: list[object] = []
         self._remote_agents: dict[int, str] = {}
+        self._remote_agent_ranks: dict[str, int] = {}
         # peer -> (layer, tensor) -> (base_ptr, bytes_per_expert, dev_id).
         self._remote_send_meta: dict[
             int, dict[tuple[int, int], tuple[int, int, int]]
         ] = {}
+
+        # The synchronous lifecycle activates this state explicitly. Until then,
+        # all callers remain on the legacy path.
+        self._sync_protocol_active = False
+        self._sync_protocol_state = _NixlEplbProtocolState(
+            local_rank=self._rank,
+            world_size=self._world_size,
+        )
 
         self._cuda_device_id = int(self._device.index or 0)
         self._remote_state_initialized = False
@@ -441,9 +806,15 @@ class NixlEplbCommunicator(EplbCommunicator):
                 continue
             peer_metadata = gathered_metadata[peer]
             assert peer_metadata is not None
-            self._remote_agents[peer] = self._nixl_wrapper.add_remote_agent(
-                peer_metadata
-            )
+            agent_name = self._nixl_wrapper.add_remote_agent(peer_metadata)
+            previous_rank = self._remote_agent_ranks.get(agent_name)
+            if previous_rank is not None:
+                raise RuntimeError(
+                    "NIXL EPLB remote agent name is not unique: "
+                    f"agent={agent_name!r}, ranks={previous_rank},{peer}"
+                )
+            self._remote_agents[peer] = agent_name
+            self._remote_agent_ranks[agent_name] = peer
 
     def _init_registered_buffers(self) -> None:
         all_tensors: list[torch.Tensor] = []
@@ -609,6 +980,7 @@ class NixlEplbCommunicator(EplbCommunicator):
                 with contextlib.suppress(Exception):
                     self._nixl_wrapper.remove_remote_agent(agent_name)
             self._remote_agents.clear()
+            self._remote_agent_ranks.clear()
 
 
 class PyNcclEplbCommunicator(EplbCommunicator):
