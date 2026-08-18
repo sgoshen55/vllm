@@ -2,12 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import random
+import time
+import uuid
+from datetime import timedelta
 
 import pytest
 import torch
 import torch.distributed
 
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.distributed import nixl_utils
 from vllm.distributed.eplb.eplb_communicator import (
     create_eplb_communicator,
     has_nixl,
@@ -21,6 +25,7 @@ from vllm.distributed.parallel_state import (
     ensure_model_parallel_initialized,
     get_tp_group,
 )
+from vllm.platforms import current_platform
 
 from .eplb_utils import distributed_run, set_env_vars_and_device
 
@@ -291,6 +296,155 @@ def create_eplb_communicator_or_raise(
         raise RuntimeError(
             f"Failed to create EPLB communicator for backend={backend}: {exc}"
         ) from exc
+
+
+def _test_nixl_read_completion_notification_worker(
+    env: dict[str, str],
+    world_size: int,
+    run_id: str,
+) -> None:
+    assert world_size == 2
+    set_env_vars_and_device(env)
+
+    vllm_config = VllmConfig()
+    vllm_config.parallel_config.tensor_parallel_size = world_size
+    with set_current_vllm_config(vllm_config):
+        ensure_model_parallel_initialized(
+            tensor_model_parallel_size=world_size,
+            pipeline_model_parallel_size=1,
+        )
+
+        rank = torch.distributed.get_rank()
+        peer_rank = 1 - rank
+        cpu_group = get_tp_group().cpu_group
+        device = torch.device(f"cuda:{rank}")
+
+        expected = torch.arange(1 << 20, dtype=torch.float32, device=device)
+        buffer = expected if rank == 0 else torch.zeros_like(expected)
+        torch.cuda.synchronize(device)
+
+        wrapper_cls = nixl_utils.NixlWrapper
+        config_cls = nixl_utils.nixl_agent_config
+        assert wrapper_cls is not None and config_cls is not None
+        config = config_cls(capture_telemetry=False, backends=["UCX"])
+        agent = wrapper_cls(f"eplb-notif-{rank}-{run_id}", config)
+
+        registration = agent.get_reg_descs([buffer])
+        agent.register_memory(registration, backends=["UCX"])
+
+        local_info = {
+            "metadata": agent.get_agent_metadata(),
+            "buffer": (buffer.data_ptr(), buffer.nbytes, buffer.get_device()),
+        }
+        gathered_info: list[dict[str, object] | None] = [None] * world_size
+        torch.distributed.all_gather_object(
+            gathered_info,
+            local_info,
+            group=cpu_group,
+        )
+
+        peer_info = gathered_info[peer_rank]
+        assert peer_info is not None
+        peer_metadata = peer_info["metadata"]
+        assert isinstance(peer_metadata, bytes)
+        peer_agent_name = agent.add_remote_agent(peer_metadata)
+
+        notification = f"eplb-read-done:{run_id}".encode()
+        local_handle = None
+        remote_handle = None
+        xfer_handle = None
+
+        if rank == 1:
+            source_info = gathered_info[0]
+            assert source_info is not None
+            source_buffer = source_info["buffer"]
+            assert isinstance(source_buffer, tuple)
+
+            local_descs = agent.get_xfer_descs(
+                [(buffer.data_ptr(), buffer.nbytes, buffer.get_device())],
+                "VRAM",
+            )
+            remote_descs = agent.get_xfer_descs([source_buffer], "VRAM")
+            local_handle = agent.prep_xfer_dlist(
+                "NIXL_INIT_AGENT",
+                local_descs,
+                backends=["UCX"],
+            )
+            remote_handle = agent.prep_xfer_dlist(
+                peer_agent_name,
+                remote_descs,
+                backends=["UCX"],
+            )
+            xfer_handle = agent.make_prepped_xfer(
+                "READ",
+                local_handle,
+                [0],
+                remote_handle,
+                [0],
+                notif_msg=notification,
+                backends=["UCX"],
+            )
+            assert agent.query_xfer_backend(xfer_handle) == "UCX"
+
+            state = agent.transfer(xfer_handle)
+            assert state in ("DONE", "PROC")
+            deadline = time.monotonic() + 30
+            while state == "PROC" and time.monotonic() < deadline:
+                state = agent.check_xfer_state(xfer_handle)
+                if state == "PROC":
+                    time.sleep(0.0005)
+            assert state == "DONE"
+        else:
+            received: list[bytes] = []
+            deadline = time.monotonic() + 30
+            while notification not in received and time.monotonic() < deadline:
+                notifications = agent.get_new_notifs(backends=["UCX"])
+                for sender, payloads in notifications.items():
+                    assert sender == peer_agent_name
+                    received.extend(payloads)
+                if notification not in received:
+                    time.sleep(0.0005)
+            assert received == [notification]
+            buffer.fill_(-1)
+            torch.cuda.synchronize(device)
+
+        torch.distributed.monitored_barrier(
+            group=cpu_group,
+            timeout=timedelta(seconds=30),
+        )
+        if rank == 1:
+            torch.cuda.synchronize(device)
+            assert torch.equal(buffer, expected)
+        torch.distributed.monitored_barrier(
+            group=cpu_group,
+            timeout=timedelta(seconds=30),
+        )
+
+        if xfer_handle is not None:
+            agent.release_xfer_handle(xfer_handle)
+        if local_handle is not None:
+            agent.release_dlist_handle(local_handle)
+        if remote_handle is not None:
+            agent.release_dlist_handle(remote_handle)
+        agent.deregister_memory(registration, backends=["UCX"])
+        agent.remove_remote_agent(peer_agent_name)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="NIXL READ notification capability proof requires NVIDIA CUDA",
+)
+@pytest.mark.skipif(not has_nixl(), reason="NIXL is not available")
+def test_nixl_read_completion_notification() -> None:
+    """Prove that a receiver-initiated READ notifies its source on completion."""
+    world_size = 2
+    if torch.accelerator.device_count() < world_size:
+        pytest.skip(f"Need at least {world_size} GPUs to run the test")
+    distributed_run(
+        _test_nixl_read_completion_notification_worker,
+        world_size,
+        uuid.uuid4().hex[:8],
+    )
 
 
 def _test_async_transfer_layer_without_mtp_worker(
