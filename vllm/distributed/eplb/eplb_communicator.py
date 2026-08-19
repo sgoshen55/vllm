@@ -40,8 +40,10 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 _NIXL_EPLB_NOTIFICATION_MAGIC = b"EPLB"
-_NIXL_EPLB_NOTIFICATION_VERSION = 1
+_NIXL_EPLB_NOTIFICATION_VERSION = 2
+_NIXL_EPLB_NOTIFICATION_HEADER_STRUCT = struct.Struct("!4sBB")
 _NIXL_EPLB_NOTIFICATION_STRUCT = struct.Struct("!4sBBQIIIII")
+_NIXL_EPLB_ABORT_NOTIFICATION_STRUCT = struct.Struct("!4sBBQIIII")
 _NIXL_EPLB_DEFAULT_TIMEOUT_SECONDS = 300.0
 
 
@@ -54,6 +56,15 @@ def _normalize_nixl_agent_name(agent_name: str | bytes) -> str:
 class _NixlEplbNotificationKind(IntEnum):
     READY = 1
     READ_DONE = 2
+    ABORT = 3
+
+
+class _NixlEplbAbortReason(IntEnum):
+    PROTOCOL_ERROR = 1
+    READY_TIMEOUT = 2
+    READ_FAILURE = 3
+    READ_TIMEOUT = 4
+    READ_DONE_TIMEOUT = 5
 
 
 class _NixlEplbNotificationDisposition(Enum):
@@ -121,6 +132,8 @@ class _NixlEplbNotification:
                 )
         if not isinstance(self.kind, _NixlEplbNotificationKind):
             raise ValueError(f"Invalid NIXL EPLB notification kind: {self.kind!r}")
+        if self.kind == _NixlEplbNotificationKind.ABORT:
+            raise ValueError("ABORT requires the NIXL EPLB abort payload")
         return _NIXL_EPLB_NOTIFICATION_STRUCT.pack(
             _NIXL_EPLB_NOTIFICATION_MAGIC,
             _NIXL_EPLB_NOTIFICATION_VERSION,
@@ -164,6 +177,8 @@ class _NixlEplbNotification:
             raise ValueError(
                 f"Invalid NIXL EPLB notification kind: {kind_value}"
             ) from exc
+        if kind == _NixlEplbNotificationKind.ABORT:
+            raise ValueError("ABORT requires the NIXL EPLB abort payload")
         return cls(
             kind=kind,
             key=_NixlEplbTransferKey(
@@ -192,6 +207,124 @@ class _NixlEplbNotification:
                 f"expected_sender={expected_sender}, receiver={receiver_rank}, "
                 f"expected_receiver={expected_receiver}, key={self.key}"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class _NixlEplbAbortNotification:
+    generation: int
+    layer: int
+    origin: int
+    target: int
+    reason: _NixlEplbAbortReason
+
+    def encode(self) -> bytes:
+        values = {
+            "generation": (self.generation, (1 << 64) - 1),
+            "layer": (self.layer, (1 << 32) - 1),
+            "origin": (self.origin, (1 << 32) - 1),
+            "target": (self.target, (1 << 32) - 1),
+        }
+        for name, (value, maximum) in values.items():
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"NIXL EPLB ABORT {name} must be an integer")
+            if not 0 <= value <= maximum:
+                raise ValueError(
+                    f"NIXL EPLB ABORT {name} must be between 0 and {maximum}, "
+                    f"got {value}"
+                )
+        if not isinstance(self.reason, _NixlEplbAbortReason):
+            raise ValueError(f"Invalid NIXL EPLB ABORT reason: {self.reason!r}")
+        return _NIXL_EPLB_ABORT_NOTIFICATION_STRUCT.pack(
+            _NIXL_EPLB_NOTIFICATION_MAGIC,
+            _NIXL_EPLB_NOTIFICATION_VERSION,
+            _NixlEplbNotificationKind.ABORT,
+            self.generation,
+            self.layer,
+            self.origin,
+            self.target,
+            self.reason,
+        )
+
+    @classmethod
+    def decode(cls, payload: bytes) -> "_NixlEplbAbortNotification":
+        if len(payload) != _NIXL_EPLB_ABORT_NOTIFICATION_STRUCT.size:
+            raise ValueError(
+                "Invalid NIXL EPLB ABORT notification length: "
+                f"expected {_NIXL_EPLB_ABORT_NOTIFICATION_STRUCT.size}, "
+                f"got {len(payload)}"
+            )
+        (
+            magic,
+            version,
+            kind_value,
+            generation,
+            layer,
+            origin,
+            target,
+            reason_value,
+        ) = _NIXL_EPLB_ABORT_NOTIFICATION_STRUCT.unpack(payload)
+        if magic != _NIXL_EPLB_NOTIFICATION_MAGIC:
+            raise ValueError(f"Invalid NIXL EPLB ABORT magic: {magic!r}")
+        if version != _NIXL_EPLB_NOTIFICATION_VERSION:
+            raise ValueError(
+                "Unsupported NIXL EPLB ABORT version: "
+                f"expected {_NIXL_EPLB_NOTIFICATION_VERSION}, got {version}"
+            )
+        if kind_value != _NixlEplbNotificationKind.ABORT:
+            raise ValueError(f"Invalid NIXL EPLB ABORT kind: {kind_value}")
+        try:
+            reason = _NixlEplbAbortReason(reason_value)
+        except ValueError as exc:
+            raise ValueError(f"Invalid NIXL EPLB ABORT reason: {reason_value}") from exc
+        return cls(
+            generation=generation,
+            layer=layer,
+            origin=origin,
+            target=target,
+            reason=reason,
+        )
+
+    def validate_route(self, sender_rank: int, receiver_rank: int) -> None:
+        if sender_rank != self.origin or receiver_rank != self.target:
+            raise RuntimeError(
+                "NIXL EPLB ABORT route mismatch: "
+                f"sender={sender_rank}, expected_sender={self.origin}, "
+                f"receiver={receiver_rank}, expected_receiver={self.target}, "
+                f"generation={self.generation}, layer={self.layer}"
+            )
+
+
+_NixlEplbProtocolNotification = _NixlEplbNotification | _NixlEplbAbortNotification
+
+
+def _decode_nixl_eplb_notification(payload: bytes) -> _NixlEplbProtocolNotification:
+    if len(payload) < _NIXL_EPLB_NOTIFICATION_HEADER_STRUCT.size:
+        raise ValueError(
+            "Invalid NIXL EPLB notification length: "
+            f"minimum {_NIXL_EPLB_NOTIFICATION_HEADER_STRUCT.size}, "
+            f"got {len(payload)}"
+        )
+    magic, version, kind_value = _NIXL_EPLB_NOTIFICATION_HEADER_STRUCT.unpack_from(
+        payload
+    )
+    if magic != _NIXL_EPLB_NOTIFICATION_MAGIC:
+        raise ValueError(f"Invalid NIXL EPLB notification magic: {magic!r}")
+    if version != _NIXL_EPLB_NOTIFICATION_VERSION:
+        raise ValueError(
+            "Unsupported NIXL EPLB notification version: "
+            f"expected {_NIXL_EPLB_NOTIFICATION_VERSION}, got {version}"
+        )
+    try:
+        kind = _NixlEplbNotificationKind(kind_value)
+    except ValueError as exc:
+        raise ValueError(f"Invalid NIXL EPLB notification kind: {kind_value}") from exc
+    if kind == _NixlEplbNotificationKind.ABORT:
+        return _NixlEplbAbortNotification.decode(payload)
+    return _NixlEplbNotification.decode(payload)
+
+
+class _NixlEplbPeerAbortError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +357,9 @@ class _NixlEplbExecuteStats:
     duplicate_notifications: int = 0
     stale_notifications: int = 0
     notification_poll_calls: int = 0
+    abort_sent: int = 0
+    abort_received: int = 0
+    abort_send_failures: int = 0
 
 
 @dataclass(slots=True)
@@ -268,6 +404,7 @@ class _NixlEplbProtocolState:
         self._expected_readers: dict[_NixlEplbSourceKey, frozenset[int]] = {}
         self._completed_readers: dict[_NixlEplbSourceKey, set[int]] = {}
         self._seen_ready: set[_NixlEplbTransferKey] = set()
+        self._seen_aborts: set[tuple[int, int]] = set()
         self._ready_tokens: set[_NixlEplbTransferKey] = set()
         self._deadlines: dict[
             tuple[
@@ -312,6 +449,9 @@ class _NixlEplbProtocolState:
         }
         self._seen_ready = {
             key for key in self._seen_ready if key.generation > generation
+        }
+        self._seen_aborts = {
+            abort_key for abort_key in self._seen_aborts if abort_key[0] > generation
         }
         self._deadlines = {
             deadline_key: deadline
@@ -390,6 +530,25 @@ class _NixlEplbProtocolState:
         if notification.key.reader in completed:
             return _NixlEplbNotificationDisposition.DUPLICATE
         completed.add(notification.key.reader)
+        return _NixlEplbNotificationDisposition.RECORDED
+
+    def record_abort(
+        self,
+        notification: _NixlEplbAbortNotification,
+        sender_rank: int,
+    ) -> _NixlEplbNotificationDisposition:
+        self._validate_rank(sender_rank, "sender")
+        notification.validate_route(sender_rank, self.local_rank)
+        generation = notification.generation
+        if generation <= self.completed_generation:
+            return _NixlEplbNotificationDisposition.STALE
+        if self.active_generation is not None and generation < self.active_generation:
+            return _NixlEplbNotificationDisposition.STALE
+        self._require_active_generation(generation)
+        abort_key = (generation, notification.origin)
+        if abort_key in self._seen_aborts:
+            return _NixlEplbNotificationDisposition.DUPLICATE
+        self._seen_aborts.add(abort_key)
         return _NixlEplbNotificationDisposition.RECORDED
 
     def consume_ready(self, key: _NixlEplbTransferKey) -> bool:
@@ -741,8 +900,10 @@ class NixlEplbCommunicator(EplbCommunicator):
         self._source_expectations_frozen = False
         self._ready_sent_at: dict[_NixlEplbTransferKey, float] = {}
         self._deferred_notifications: dict[
-            int, list[tuple[_NixlEplbNotification, int]]
+            int, list[tuple[_NixlEplbProtocolNotification, int]]
         ] = {}
+        self._protocol_failed = False
+        self._protocol_failure: str | None = None
 
         self._cuda_device_id = int(self._device.index or 0)
         self._remote_state_initialized = False
@@ -790,6 +951,81 @@ class NixlEplbCommunicator(EplbCommunicator):
     def set_stream(self, cuda_stream: torch.cuda.Stream | None) -> None:
         pass
 
+    def _raise_if_sync_protocol_failed(self) -> None:
+        if self._protocol_failed:
+            raise RuntimeError(
+                "NIXL EPLB synchronous communicator failed and cannot be reused; "
+                "recreate the communicator or worker. "
+                f"previous_failure={self._protocol_failure}"
+            )
+
+    @staticmethod
+    def _mark_abort_reason(
+        exc: Exception,
+        reason: _NixlEplbAbortReason,
+    ) -> None:
+        with contextlib.suppress(Exception):
+            exc._nixl_eplb_abort_reason = reason  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _abort_reason_for_exception(exc: Exception) -> _NixlEplbAbortReason:
+        reason = getattr(
+            exc,
+            "_nixl_eplb_abort_reason",
+            _NixlEplbAbortReason.PROTOCOL_ERROR,
+        )
+        if isinstance(reason, _NixlEplbAbortReason):
+            return reason
+        return _NixlEplbAbortReason.PROTOCOL_ERROR
+
+    def _broadcast_abort(self, reason: _NixlEplbAbortReason) -> None:
+        generation = self._sync_protocol_state.active_generation
+        layer = self._layer_idx
+        if generation is None or layer is None:
+            return
+        for peer, agent_name in self._remote_agents.items():
+            notification = _NixlEplbAbortNotification(
+                generation=generation,
+                layer=layer,
+                origin=self._rank,
+                target=peer,
+                reason=reason,
+            )
+            try:
+                self._nixl_wrapper.send_notif(
+                    agent_name,
+                    notif_msg=notification.encode(),
+                )
+                if self._sync_stats is not None:
+                    self._sync_stats.abort_sent += 1
+            except Exception as exc:
+                if self._sync_stats is not None:
+                    self._sync_stats.abort_send_failures += 1
+                logger.warning(
+                    "NIXL EPLB failed to send ABORT: rank=%d peer=%d "
+                    "generation=%d layer=%d reason=%s error=%r",
+                    self._rank,
+                    peer,
+                    generation,
+                    layer,
+                    reason.name,
+                    exc,
+                )
+
+    def _fail_sync_protocol(self, exc: Exception, *, broadcast: bool) -> None:
+        if self._protocol_failed:
+            return
+        if broadcast:
+            self._broadcast_abort(self._abort_reason_for_exception(exc))
+        self._protocol_failed = True
+        self._protocol_failure = f"{type(exc).__name__}: {exc}"
+        if self._sync_stats is not None:
+            self._last_execute_stats = self._sync_stats
+        if self._sync_protocol_state.active_generation is not None:
+            with contextlib.suppress(Exception):
+                self._sync_protocol_state.end_generation(success=False)
+        self._clear_transfer_state()
+
     def add_send(
         self,
         tensors: list[torch.Tensor],
@@ -798,40 +1034,47 @@ class NixlEplbCommunicator(EplbCommunicator):
     ) -> None:
         if not self._sync_protocol_active:
             return
-        key = self._make_transfer_key(
-            expert_id=expert_id,
-            source=self._rank,
-            reader=dst_rank,
-        )
-        if self._source_expectations_frozen:
-            raise RuntimeError(
-                "NIXL EPLB add_send() must precede add_recv() and execute()"
-            )
-        if key in self._ready_sent_at:
-            raise RuntimeError(f"Duplicate NIXL EPLB add_send(): key={key}")
-
-        readers = self._source_readers.setdefault(key.source_key, set())
-        readers.add(dst_rank)
-        notification = _NixlEplbNotification(
-            _NixlEplbNotificationKind.READY,
-            key,
-        )
-        sent_at = time.perf_counter()
+        self._raise_if_sync_protocol_failed()
         try:
-            self._nixl_wrapper.send_notif(
-                self._remote_agents[dst_rank],
-                notif_msg=notification.encode(),
+            key = self._make_transfer_key(
+                expert_id=expert_id,
+                source=self._rank,
+                reader=dst_rank,
             )
-        except Exception:
-            readers.remove(dst_rank)
-            if not readers:
-                del self._source_readers[key.source_key]
+            if self._source_expectations_frozen:
+                raise RuntimeError(
+                    "NIXL EPLB add_send() must precede add_recv() and execute()"
+                )
+            if key in self._ready_sent_at:
+                raise RuntimeError(f"Duplicate NIXL EPLB add_send(): key={key}")
+
+            readers = self._source_readers.setdefault(key.source_key, set())
+            readers.add(dst_rank)
+            notification = _NixlEplbNotification(
+                _NixlEplbNotificationKind.READY,
+                key,
+            )
+            sent_at = time.perf_counter()
+            try:
+                self._nixl_wrapper.send_notif(
+                    self._remote_agents[dst_rank],
+                    notif_msg=notification.encode(),
+                )
+            except Exception:
+                readers.remove(dst_rank)
+                if not readers:
+                    del self._source_readers[key.source_key]
+                raise
+            self._ready_sent_at[key] = sent_at
+            assert self._sync_stats is not None
+            self._sync_stats.ready_sent += 1
+        except Exception as exc:
+            self._fail_sync_protocol(exc, broadcast=True)
             raise
-        self._ready_sent_at[key] = sent_at
-        assert self._sync_stats is not None
-        self._sync_stats.ready_sent += 1
 
     def set_transfer_context(self, old_indices: np.ndarray, layer_idx: int) -> None:
+        if self._sync_protocol_active:
+            self._raise_if_sync_protocol_failed()
         self._ensure_remote_state()
         pending_count = (
             len(self._xfer_entries) + len(self._pending_reads) + len(self._active_reads)
@@ -862,6 +1105,8 @@ class NixlEplbCommunicator(EplbCommunicator):
         src_rank: int,
         expert_id: int,
     ) -> None:
+        if self._sync_protocol_active:
+            self._raise_if_sync_protocol_failed()
         assert self._expert_to_src_row is not None and self._layer_idx is not None, (
             "set_transfer_context() must be called before add_recv()"
         )
@@ -869,29 +1114,39 @@ class NixlEplbCommunicator(EplbCommunicator):
             self._post_legacy_read(tensors, src_rank, expert_id)
             return
 
-        key = self._make_transfer_key(
-            expert_id=expert_id,
-            source=src_rank,
-            reader=self._rank,
-        )
-        if key in self._recv_keys:
-            raise RuntimeError(f"Duplicate NIXL EPLB add_recv(): key={key}")
-        self._recv_keys.add(key)
-        request = _NixlEplbPendingRead(
-            key=key,
-            tensors=tensors,
-            queued_at=time.perf_counter(),
-        )
+        try:
+            key = self._make_transfer_key(
+                expert_id=expert_id,
+                source=src_rank,
+                reader=self._rank,
+            )
+            if key in self._recv_keys:
+                raise RuntimeError(f"Duplicate NIXL EPLB add_recv(): key={key}")
+            self._recv_keys.add(key)
+            request = _NixlEplbPendingRead(
+                key=key,
+                tensors=tensors,
+                queued_at=time.perf_counter(),
+            )
 
-        self._freeze_source_expectations()
-        self._progress_notifications_once()
-        if self._sync_protocol_state.consume_ready(key):
-            self._record_ready_wait(request)
-            self._post_sync_read(request)
-            return
+            self._freeze_source_expectations()
+            self._progress_notifications_once()
+            if self._sync_protocol_state.consume_ready(key):
+                self._record_ready_wait(request)
+                self._post_sync_read(request)
+                return
 
-        self._pending_reads[key] = request
-        self._sync_protocol_state.arm_deadline(_NixlEplbDeadlinePhase.READY, key)
+            self._pending_reads[key] = request
+            self._sync_protocol_state.arm_deadline(
+                _NixlEplbDeadlinePhase.READY,
+                key,
+            )
+        except _NixlEplbPeerAbortError as exc:
+            self._fail_sync_protocol(exc, broadcast=False)
+            raise
+        except Exception as exc:
+            self._fail_sync_protocol(exc, broadcast=True)
+            raise
 
     def _make_transfer_key(
         self,
@@ -1068,7 +1323,7 @@ class NixlEplbCommunicator(EplbCommunicator):
                     f"agent={normalized_name!r}"
                 )
             for payload in payloads:
-                notification = _NixlEplbNotification.decode(payload)
+                notification = _decode_nixl_eplb_notification(payload)
                 made_progress = (
                     self._record_or_defer_notification(notification, sender_rank)
                     or made_progress
@@ -1085,15 +1340,20 @@ class NixlEplbCommunicator(EplbCommunicator):
 
     def _record_or_defer_notification(
         self,
-        notification: _NixlEplbNotification,
+        notification: _NixlEplbProtocolNotification,
         sender_rank: int,
     ) -> bool:
         notification.validate_route(sender_rank, self._rank)
         active_generation = self._sync_protocol_state.active_generation
         assert active_generation is not None
-        if notification.key.generation > active_generation:
+        generation = (
+            notification.generation
+            if isinstance(notification, _NixlEplbAbortNotification)
+            else notification.key.generation
+        )
+        if generation > active_generation:
             self._deferred_notifications.setdefault(
-                notification.key.generation,
+                generation,
                 [],
             ).append((notification, sender_rank))
             return True
@@ -1102,20 +1362,33 @@ class NixlEplbCommunicator(EplbCommunicator):
 
     def _record_notification(
         self,
-        notification: _NixlEplbNotification,
+        notification: _NixlEplbProtocolNotification,
         sender_rank: int,
     ) -> None:
         assert self._sync_stats is not None
-        disposition = self._sync_protocol_state.record_notification(
-            notification,
-            sender_rank,
-        )
+        if isinstance(notification, _NixlEplbAbortNotification):
+            disposition = self._sync_protocol_state.record_abort(
+                notification,
+                sender_rank,
+            )
+        else:
+            disposition = self._sync_protocol_state.record_notification(
+                notification,
+                sender_rank,
+            )
         if disposition == _NixlEplbNotificationDisposition.DUPLICATE:
             self._sync_stats.duplicate_notifications += 1
             return
         if disposition == _NixlEplbNotificationDisposition.STALE:
             self._sync_stats.stale_notifications += 1
             return
+        if isinstance(notification, _NixlEplbAbortNotification):
+            self._sync_stats.abort_received += 1
+            raise _NixlEplbPeerAbortError(
+                "NIXL EPLB synchronous generation aborted by peer: "
+                f"generation={notification.generation}, layer={notification.layer}, "
+                f"origin={notification.origin}, reason={notification.reason.name}"
+            )
         if notification.kind == _NixlEplbNotificationKind.READY:
             self._sync_stats.ready_received += 1
             return
@@ -1185,7 +1458,9 @@ class NixlEplbCommunicator(EplbCommunicator):
             read_started = time.perf_counter()
             state = self._nixl_wrapper.transfer(xfer_h)
             if state not in ("DONE", "PROC"):
-                raise RuntimeError(f"NIXL transfer failed with state={state}")
+                exc = RuntimeError(f"NIXL transfer failed with state={state}")
+                self._mark_abort_reason(exc, _NixlEplbAbortReason.READ_FAILURE)
+                raise exc
             self._sync_protocol_state.arm_deadline(
                 _NixlEplbDeadlinePhase.READ,
                 request.key,
@@ -1200,7 +1475,8 @@ class NixlEplbCommunicator(EplbCommunicator):
             )
             self._sync_stats.reads_posted += 1
             self._sync_stats.read_done_attached += 1
-        except Exception:
+        except Exception as exc:
+            self._mark_abort_reason(exc, _NixlEplbAbortReason.READ_FAILURE)
             if xfer_h is not None:
                 with contextlib.suppress(Exception):
                     self._nixl_wrapper.release_xfer_handle(xfer_h)
@@ -1223,6 +1499,12 @@ class NixlEplbCommunicator(EplbCommunicator):
                 progress_started = time.perf_counter()
                 try:
                     state = self._nixl_wrapper.check_xfer_state(entry.xfer_handle)
+                except Exception as exc:
+                    self._mark_abort_reason(
+                        exc,
+                        _NixlEplbAbortReason.READ_FAILURE,
+                    )
+                    raise
                 finally:
                     self._sync_stats.read_progress_seconds += (
                         time.perf_counter() - progress_started
@@ -1231,7 +1513,9 @@ class NixlEplbCommunicator(EplbCommunicator):
             if state == "PROC":
                 continue
             if state != "DONE":
-                raise RuntimeError(f"NIXL transfer failed with state={state}")
+                exc = RuntimeError(f"NIXL transfer failed with state={state}")
+                self._mark_abort_reason(exc, _NixlEplbAbortReason.READ_FAILURE)
+                raise exc
 
             elapsed = time.perf_counter() - entry.posted_at
             self._sync_stats.read_completion_sum_seconds += elapsed
@@ -1279,7 +1563,18 @@ class NixlEplbCommunicator(EplbCommunicator):
         details = ", ".join(
             f"phase={deadline.phase.value}, key={deadline.key}" for deadline in expired
         )
-        raise RuntimeError(f"NIXL EPLB synchronous protocol timed out: {details}")
+        reasons = {
+            _NixlEplbDeadlinePhase.READY: _NixlEplbAbortReason.READY_TIMEOUT,
+            _NixlEplbDeadlinePhase.READ: _NixlEplbAbortReason.READ_TIMEOUT,
+            _NixlEplbDeadlinePhase.READ_DONE: (_NixlEplbAbortReason.READ_DONE_TIMEOUT),
+        }
+        reason = reasons.get(
+            expired[0].phase,
+            _NixlEplbAbortReason.PROTOCOL_ERROR,
+        )
+        exc = RuntimeError(f"NIXL EPLB synchronous protocol timed out: {details}")
+        self._mark_abort_reason(exc, reason)
+        raise exc
 
     def _wait_for_all_transfers(self, handles: list[int]) -> None:
         pending = set(handles)
@@ -1399,6 +1694,7 @@ class NixlEplbCommunicator(EplbCommunicator):
                 self._clear_transfer_state()
             return
 
+        self._raise_if_sync_protocol_failed()
         if self._layer_idx is None or self._sync_stats is None:
             raise RuntimeError(
                 "set_transfer_context() must be called before synchronous "
@@ -1408,7 +1704,6 @@ class NixlEplbCommunicator(EplbCommunicator):
         generation = self._sync_protocol_state.active_generation
         assert generation is not None
         execute_started = time.perf_counter()
-        success = False
         try:
             self._freeze_source_expectations()
             while True:
@@ -1416,14 +1711,19 @@ class NixlEplbCommunicator(EplbCommunicator):
                 self._raise_for_unmatched_ready()
                 made_progress = self._progress_active_reads() or made_progress
                 if self._sync_work_complete():
-                    success = True
                     break
                 self._raise_for_expired_deadlines()
                 if not made_progress:
                     time.sleep(0.0005)
-        finally:
-            self._sync_protocol_state.end_generation(success=success)
+            self._sync_protocol_state.end_generation(success=True)
             self._clear_transfer_state()
+        except _NixlEplbPeerAbortError as exc:
+            self._fail_sync_protocol(exc, broadcast=False)
+            raise
+        except Exception as exc:
+            self._fail_sync_protocol(exc, broadcast=True)
+            raise
+        finally:
             stats.execute_seconds = time.perf_counter() - execute_started
             self._last_execute_stats = stats
             logger.debug(
@@ -1435,7 +1735,8 @@ class NixlEplbCommunicator(EplbCommunicator):
                 "read_done_wait_sum_ms=%.3f read_done_wait_max_ms=%.3f "
                 "barrier_ms=%.3f ready_sent=%d ready_received=%d "
                 "read_done_attached=%d read_done_received=%d "
-                "duplicate_notifications=%d stale_notifications=%d polls=%d",
+                "duplicate_notifications=%d stale_notifications=%d polls=%d "
+                "abort_sent=%d abort_received=%d abort_send_failures=%d",
                 self._rank,
                 generation,
                 stats.sync_protocol_active,
@@ -1457,6 +1758,9 @@ class NixlEplbCommunicator(EplbCommunicator):
                 stats.duplicate_notifications,
                 stats.stale_notifications,
                 stats.notification_poll_calls,
+                stats.abort_sent,
+                stats.abort_received,
+                stats.abort_send_failures,
             )
 
     def __del__(self) -> None:

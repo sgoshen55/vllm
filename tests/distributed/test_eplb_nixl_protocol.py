@@ -9,12 +9,17 @@ import torch
 
 import vllm.distributed.eplb.eplb_communicator as eplb_communicator
 from vllm.distributed.eplb.eplb_communicator import (
+    _NIXL_EPLB_ABORT_NOTIFICATION_STRUCT,
     _NIXL_EPLB_NOTIFICATION_STRUCT,
     NixlEplbCommunicator,
+    _decode_nixl_eplb_notification,
+    _NixlEplbAbortNotification,
+    _NixlEplbAbortReason,
     _NixlEplbDeadlinePhase,
     _NixlEplbNotification,
     _NixlEplbNotificationDisposition,
     _NixlEplbNotificationKind,
+    _NixlEplbPeerAbortError,
     _NixlEplbProtocolState,
     _NixlEplbTransferKey,
     create_eplb_communicator,
@@ -45,6 +50,7 @@ class FakeNixlAgent:
         self.prepped_xfers: list[dict[str, object]] = []
         self.transfer_state = "DONE"
         self.check_states: list[str] = []
+        self.notification_errors: dict[str | bytes, Exception] = {}
         self._next_handle = 10
 
     def get_agent_metadata(self) -> bytes:
@@ -57,6 +63,9 @@ class FakeNixlAgent:
         pass
 
     def send_notif(self, agent_name: str | bytes, notif_msg: bytes) -> None:
+        error = self.notification_errors.get(agent_name)
+        if error is not None:
+            raise error
         self.sent_notifications.append((agent_name, notif_msg))
 
     def get_new_notifs(self) -> dict[str | bytes, list[bytes]]:
@@ -125,15 +134,16 @@ def make_sync_communicator(
     agent: FakeNixlAgent,
     generation: int = 7,
     layer: int = 3,
+    world_size: int = 2,
 ) -> NixlEplbCommunicator:
-    peer = 1 - rank
+    peers = [peer for peer in range(world_size) if peer != rank]
     communicator = object.__new__(NixlEplbCommunicator)
     communicator._rank = rank
-    communicator._world_size = 2
+    communicator._world_size = world_size
     communicator._sync_protocol_active = True
     communicator._sync_protocol_state = _NixlEplbProtocolState(
         local_rank=rank,
-        world_size=2,
+        world_size=world_size,
     )
     communicator._sync_protocol_state.begin_generation(generation)
     communicator._next_sync_generation = generation + 1
@@ -148,16 +158,18 @@ def make_sync_communicator(
     communicator._source_expectations_frozen = False
     communicator._ready_sent_at = {}
     communicator._deferred_notifications = {}
+    communicator._protocol_failed = False
+    communicator._protocol_failure = None
     communicator._last_execute_stats = None
-    communicator._expert_to_src_row = [{11: 0}, {11: 0}]
+    communicator._expert_to_src_row = [{11: 0} for _ in range(world_size)]
     communicator._layer_idx = layer
     communicator._nixl_wrapper = agent
     communicator._nixl_memory_type = "VRAM"
     communicator._cuda_device_id = rank
-    communicator._remote_agents = {peer: f"peer-{peer}"}
-    communicator._remote_agent_ranks = {f"peer-{peer}": peer}
+    communicator._remote_agents = {peer: f"peer-{peer}" for peer in peers}
+    communicator._remote_agent_ranks = {f"peer-{peer}": peer for peer in peers}
     communicator._remote_send_meta = {
-        peer: {(layer, 0): (1000, 16, peer)},
+        peer: {(layer, 0): (1000, 16, peer)} for peer in peers
     }
     communicator._registered_descs = []
     return communicator
@@ -191,7 +203,30 @@ def make_transfer_key(
     )
 
 
-@pytest.mark.parametrize("kind", list(_NixlEplbNotificationKind))
+def make_abort_notification(
+    *,
+    generation: int = 7,
+    layer: int = 3,
+    origin: int = 0,
+    target: int = 1,
+    reason: _NixlEplbAbortReason = _NixlEplbAbortReason.PROTOCOL_ERROR,
+) -> _NixlEplbAbortNotification:
+    return _NixlEplbAbortNotification(
+        generation=generation,
+        layer=layer,
+        origin=origin,
+        target=target,
+        reason=reason,
+    )
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        _NixlEplbNotificationKind.READY,
+        _NixlEplbNotificationKind.READ_DONE,
+    ],
+)
 def test_notification_round_trip_preserves_full_identity(
     kind: _NixlEplbNotificationKind,
 ) -> None:
@@ -209,7 +244,7 @@ def test_notification_round_trip_preserves_full_identity(
         (lambda payload: payload[:-1], "notification length"),
         (lambda payload: b"FAIL" + payload[4:], "notification magic"),
         (
-            lambda payload: payload[:4] + b"\x02" + payload[5:],
+            lambda payload: payload[:4] + b"\xff" + payload[5:],
             "notification version",
         ),
         (
@@ -272,6 +307,28 @@ def test_notification_route_matches_kind(
 
     with pytest.raises(RuntimeError, match="route mismatch"):
         notification.validate_route(receiver, sender)
+
+
+@pytest.mark.parametrize("reason", list(_NixlEplbAbortReason))
+def test_abort_notification_round_trip(
+    reason: _NixlEplbAbortReason,
+) -> None:
+    notification = make_abort_notification(reason=reason)
+
+    payload = notification.encode()
+
+    assert len(payload) == _NIXL_EPLB_ABORT_NOTIFICATION_STRUCT.size
+    assert _NixlEplbAbortNotification.decode(payload) == notification
+    assert _decode_nixl_eplb_notification(payload) == notification
+
+
+def test_abort_notification_route_matches_origin_and_target() -> None:
+    notification = make_abort_notification()
+
+    notification.validate_route(sender_rank=0, receiver_rank=1)
+
+    with pytest.raises(RuntimeError, match="ABORT route mismatch"):
+        notification.validate_route(sender_rank=1, receiver_rank=0)
 
 
 @pytest.mark.parametrize("names_as_bytes", [False, True])
@@ -576,6 +633,194 @@ def test_execute_times_out_when_ready_never_arrives(
 
     assert communicator._sync_protocol_state.active_generation is None
     assert communicator._pending_reads == {}
+    assert communicator._protocol_failed
+    assert len(agent.sent_notifications) == 1
+    abort = _decode_nixl_eplb_notification(agent.sent_notifications[0][1])
+    assert abort == make_abort_notification(
+        origin=1,
+        target=0,
+        reason=_NixlEplbAbortReason.READY_TIMEOUT,
+    )
+
+    with pytest.raises(RuntimeError, match="cannot be reused"):
+        communicator.set_transfer_context(None, layer_idx=4)  # type: ignore[arg-type]
+
+
+def test_read_done_timeout_preserves_source_tensor_and_aborts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    agent = FakeNixlAgent()
+    communicator = make_sync_communicator(rank=0, agent=agent)
+    communicator._sync_protocol_state._clock = clock
+    communicator._sync_protocol_state.timeout_seconds = 1
+    source = torch.tensor([1.0, 2.0])
+    original = source.clone()
+    communicator.add_send([source], dst_rank=1, expert_id=11)
+    monkeypatch.setattr(eplb_communicator.time, "sleep", clock.advance)
+
+    with pytest.raises(RuntimeError, match="missing READ_DONE"):
+        communicator.execute()
+
+    assert torch.equal(source, original)
+    assert len(agent.sent_notifications) == 2
+    ready = _decode_nixl_eplb_notification(agent.sent_notifications[0][1])
+    abort = _decode_nixl_eplb_notification(agent.sent_notifications[1][1])
+    assert isinstance(ready, _NixlEplbNotification)
+    assert abort == make_abort_notification(
+        reason=_NixlEplbAbortReason.READ_DONE_TIMEOUT,
+    )
+    assert communicator._protocol_failed
+
+
+def test_read_failure_broadcasts_abort_to_every_peer_and_cleans_up() -> None:
+    agent = FakeNixlAgent()
+    agent.transfer_state = "ERR"
+    communicator = make_sync_communicator(
+        rank=1,
+        agent=agent,
+        world_size=3,
+    )
+    ready = _NixlEplbNotification(
+        _NixlEplbNotificationKind.READY,
+        make_transfer_key(),
+    )
+    agent.notifications = {"peer-0": [ready.encode()]}
+
+    with pytest.raises(RuntimeError, match="transfer failed with state=ERR"):
+        communicator.add_recv(
+            [make_fake_tensor()],  # type: ignore[list-item]
+            src_rank=0,
+            expert_id=11,
+        )
+
+    aborts = [
+        _decode_nixl_eplb_notification(payload)
+        for _, payload in agent.sent_notifications
+    ]
+    assert aborts == [
+        make_abort_notification(
+            origin=1,
+            target=0,
+            reason=_NixlEplbAbortReason.READ_FAILURE,
+        ),
+        make_abort_notification(
+            origin=1,
+            target=2,
+            reason=_NixlEplbAbortReason.READ_FAILURE,
+        ),
+    ]
+    assert agent.released_xfers == [12]
+    assert agent.released_dlists == [10, 11]
+    assert communicator._pending_reads == {}
+    assert communicator._active_reads == {}
+    assert communicator._sync_protocol_state.active_generation is None
+    assert communicator._protocol_failed
+    stats = communicator._last_execute_stats
+    assert stats is not None
+    assert stats.abort_sent == 2
+    assert stats.abort_send_failures == 0
+
+
+def test_received_abort_stops_without_rebroadcast_and_releases_active_read() -> None:
+    agent = FakeNixlAgent()
+    agent.transfer_state = "PROC"
+    communicator = make_sync_communicator(rank=1, agent=agent)
+    ready = _NixlEplbNotification(
+        _NixlEplbNotificationKind.READY,
+        make_transfer_key(),
+    )
+    agent.notifications = {"peer-0": [ready.encode()]}
+    communicator.add_recv(
+        [make_fake_tensor()],  # type: ignore[list-item]
+        src_rank=0,
+        expert_id=11,
+    )
+    agent.notifications = {
+        "peer-0": [
+            make_abort_notification(
+                reason=_NixlEplbAbortReason.PROTOCOL_ERROR,
+            ).encode()
+        ]
+    }
+
+    with pytest.raises(_NixlEplbPeerAbortError, match="aborted by peer"):
+        communicator.execute()
+
+    assert agent.sent_notifications == []
+    assert agent.check_calls == []
+    assert agent.released_xfers == [12]
+    assert agent.released_dlists == [10, 11]
+    assert communicator._active_reads == {}
+    assert communicator._protocol_failed
+    stats = communicator._last_execute_stats
+    assert stats is not None
+    assert stats.abort_received == 1
+    assert stats.abort_sent == 0
+
+
+def test_abort_send_failure_does_not_mask_read_failure() -> None:
+    agent = FakeNixlAgent()
+    agent.transfer_state = "ERR"
+    agent.notification_errors = {
+        "peer-0": RuntimeError("ABORT send failed for peer 0"),
+        "peer-2": RuntimeError("ABORT send failed for peer 2"),
+    }
+    communicator = make_sync_communicator(
+        rank=1,
+        agent=agent,
+        world_size=3,
+    )
+    ready = _NixlEplbNotification(
+        _NixlEplbNotificationKind.READY,
+        make_transfer_key(),
+    )
+    agent.notifications = {"peer-0": [ready.encode()]}
+
+    with pytest.raises(RuntimeError, match="transfer failed with state=ERR"):
+        communicator.add_recv(
+            [make_fake_tensor()],  # type: ignore[list-item]
+            src_rank=0,
+            expert_id=11,
+        )
+
+    assert agent.sent_notifications == []
+    assert communicator._protocol_failed
+    stats = communicator._last_execute_stats
+    assert stats is not None
+    assert stats.abort_sent == 0
+    assert stats.abort_send_failures == 2
+
+
+def test_future_abort_is_deferred_until_its_generation() -> None:
+    agent = FakeNixlAgent()
+    communicator = make_sync_communicator(rank=1, agent=agent)
+    future_abort = make_abort_notification(
+        generation=8,
+        layer=4,
+        reason=_NixlEplbAbortReason.READ_FAILURE,
+    )
+    agent.notifications = {"peer-0": [future_abort.encode()]}
+
+    communicator.execute()
+
+    assert communicator._deferred_notifications == {
+        8: [(future_abort, 0)],
+    }
+
+    communicator._layer_idx = 4
+    communicator._expert_to_src_row = [{11: 0}, {11: 0}]
+    communicator._sync_protocol_state.begin_generation(8)
+    communicator._sync_stats = eplb_communicator._NixlEplbExecuteStats(
+        sync_protocol_active=True
+    )
+
+    with pytest.raises(_NixlEplbPeerAbortError, match="generation=8"):
+        communicator.execute()
+
+    assert communicator._deferred_notifications == {}
+    assert communicator._protocol_failed
+    assert agent.sent_notifications == []
 
 
 def test_non_sync_execute_keeps_legacy_path_uninstrumented(
@@ -729,6 +974,28 @@ def test_ready_is_idempotent_and_consumed_once() -> None:
         == _NixlEplbNotificationDisposition.DUPLICATE
     )
     assert not state.consume_ready(key)
+
+
+def test_abort_is_idempotent_and_completed_generation_is_stale() -> None:
+    state = _NixlEplbProtocolState(local_rank=1, world_size=2)
+    state.begin_generation(7)
+    abort = make_abort_notification()
+
+    assert (
+        state.record_abort(abort, sender_rank=0)
+        == _NixlEplbNotificationDisposition.RECORDED
+    )
+    assert (
+        state.record_abort(abort, sender_rank=0)
+        == _NixlEplbNotificationDisposition.DUPLICATE
+    )
+
+    state.end_generation(success=True)
+    state.begin_generation(8)
+    assert (
+        state.record_abort(abort, sender_rank=0)
+        == _NixlEplbNotificationDisposition.STALE
+    )
 
 
 @pytest.mark.parametrize(
