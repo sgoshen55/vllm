@@ -226,6 +226,23 @@ class _NixlEplbExecuteStats:
     notification_poll_calls: int = 0
 
 
+@dataclass(slots=True)
+class _NixlEplbPendingRead:
+    key: _NixlEplbTransferKey
+    tensors: list[torch.Tensor]
+    queued_at: float
+
+
+@dataclass(slots=True)
+class _NixlEplbActiveRead:
+    key: _NixlEplbTransferKey
+    local_dlist: int
+    remote_dlist: int
+    xfer_handle: int
+    posted_at: float
+    state: str
+
+
 class _NixlEplbProtocolState:
     """Pure state for the synchronous notification protocol."""
 
@@ -352,6 +369,8 @@ class _NixlEplbProtocolState:
         generation = notification.key.generation
         if generation <= self.completed_generation:
             return _NixlEplbNotificationDisposition.STALE
+        if self.active_generation is not None and generation < self.active_generation:
+            return _NixlEplbNotificationDisposition.STALE
         self._require_active_generation(generation)
         if notification.kind == _NixlEplbNotificationKind.READY:
             if notification.key in self._seen_ready:
@@ -379,6 +398,9 @@ class _NixlEplbProtocolState:
             return False
         self._ready_tokens.remove(key)
         return True
+
+    def ready_tokens(self) -> frozenset[_NixlEplbTransferKey]:
+        return frozenset(self._ready_tokens)
 
     def arm_deadline(
         self,
@@ -454,8 +476,8 @@ class EplbCommunicator(ABC):
     def execute(self) -> None:
         """Complete all enqueued transfers.
 
-        Some backends perform communication here; others (e.g. NIXL)
-        issue transfers eagerly in add_recv and only wait here.
+        Some backends perform communication here. NIXL may issue READs
+        eagerly in add_recv and progresses any remaining work here.
         On return, all data is available in the destination buffers.
         """
 
@@ -681,10 +703,8 @@ class NixlEplbCommunicator(EplbCommunicator):
                 "expert_buffer tensors must be contiguous in memory"
             )
 
-        # (local_dlist, remote_dlist, xfer_handle) for in-flight READs;
-        # accumulated by add_recv, drained by execute.
+        # Legacy READ transfers used by asynchronous and elastic EPLB.
         self._xfer_entries: list[tuple[int, int, int]] = []
-        self._pending_read_post_seconds = 0.0
         self._last_execute_stats: _NixlEplbExecuteStats | None = None
         # Per-rank expert_id -> physical row; set by set_transfer_context.
         self._expert_to_src_row: list[dict[int, int]] | None = None
@@ -712,6 +732,17 @@ class NixlEplbCommunicator(EplbCommunicator):
             local_rank=self._rank,
             world_size=self._world_size,
         )
+        self._next_sync_generation = 0
+        self._sync_stats: _NixlEplbExecuteStats | None = None
+        self._pending_reads: dict[_NixlEplbTransferKey, _NixlEplbPendingRead] = {}
+        self._active_reads: dict[_NixlEplbTransferKey, _NixlEplbActiveRead] = {}
+        self._recv_keys: set[_NixlEplbTransferKey] = set()
+        self._source_readers: dict[_NixlEplbSourceKey, set[int]] = {}
+        self._source_expectations_frozen = False
+        self._ready_sent_at: dict[_NixlEplbTransferKey, float] = {}
+        self._deferred_notifications: dict[
+            int, list[tuple[_NixlEplbNotification, int]]
+        ] = {}
 
         self._cuda_device_id = int(self._device.index or 0)
         self._remote_state_initialized = False
@@ -765,16 +796,51 @@ class NixlEplbCommunicator(EplbCommunicator):
         dst_rank: int,
         expert_id: int,
     ) -> None:
-        # No-op: NIXL READ is receiver-initiated. The sender's expert
-        # weights are pre-registered and always readable in-place.
-        pass
+        if not self._sync_protocol_active:
+            return
+        key = self._make_transfer_key(
+            expert_id=expert_id,
+            source=self._rank,
+            reader=dst_rank,
+        )
+        if self._source_expectations_frozen:
+            raise RuntimeError(
+                "NIXL EPLB add_send() must precede add_recv() and execute()"
+            )
+        if key in self._ready_sent_at:
+            raise RuntimeError(f"Duplicate NIXL EPLB add_send(): key={key}")
+
+        readers = self._source_readers.setdefault(key.source_key, set())
+        readers.add(dst_rank)
+        notification = _NixlEplbNotification(
+            _NixlEplbNotificationKind.READY,
+            key,
+        )
+        sent_at = time.perf_counter()
+        try:
+            self._nixl_wrapper.send_notif(
+                self._remote_agents[dst_rank],
+                notif_msg=notification.encode(),
+            )
+        except Exception:
+            readers.remove(dst_rank)
+            if not readers:
+                del self._source_readers[key.source_key]
+            raise
+        self._ready_sent_at[key] = sent_at
+        assert self._sync_stats is not None
+        self._sync_stats.ready_sent += 1
 
     def set_transfer_context(self, old_indices: np.ndarray, layer_idx: int) -> None:
         self._ensure_remote_state()
-        assert not self._xfer_entries, (
-            f"set_transfer_context() called with {len(self._xfer_entries)} "
-            f"pending transfers from layer {self._layer_idx}; "
-            f"execute() was not called after previous add_recv() calls"
+        pending_count = (
+            len(self._xfer_entries) + len(self._pending_reads) + len(self._active_reads)
+        )
+        generation_active = self._sync_protocol_state.active_generation is not None
+        assert not pending_count and not generation_active, (
+            f"set_transfer_context() called with {pending_count} pending transfers "
+            f"from layer {self._layer_idx}; execute() was not called after the "
+            "previous transfer setup"
         )
         self._layer_idx = layer_idx
         n = self._num_local_experts
@@ -783,6 +849,12 @@ class NixlEplbCommunicator(EplbCommunicator):
             {int(eid): i for i, eid in enumerate(row) if eid != -1}
             for row in rank_experts
         ]
+        if self._sync_protocol_active:
+            generation = self._next_sync_generation
+            self._next_sync_generation += 1
+            self._sync_protocol_state.begin_generation(generation)
+            self._sync_stats = _NixlEplbExecuteStats(sync_protocol_active=True)
+            self._source_expectations_frozen = False
 
     def add_recv(
         self,
@@ -790,12 +862,64 @@ class NixlEplbCommunicator(EplbCommunicator):
         src_rank: int,
         expert_id: int,
     ) -> None:
-        # Build NIXL descriptors and issue the RDMA READ immediately,
-        # overlapping the transfer with the remaining Python loop in
-        # move_to_buffer.
         assert self._expert_to_src_row is not None and self._layer_idx is not None, (
             "set_transfer_context() must be called before add_recv()"
         )
+        if not self._sync_protocol_active:
+            self._post_legacy_read(tensors, src_rank, expert_id)
+            return
+
+        key = self._make_transfer_key(
+            expert_id=expert_id,
+            source=src_rank,
+            reader=self._rank,
+        )
+        if key in self._recv_keys:
+            raise RuntimeError(f"Duplicate NIXL EPLB add_recv(): key={key}")
+        self._recv_keys.add(key)
+        request = _NixlEplbPendingRead(
+            key=key,
+            tensors=tensors,
+            queued_at=time.perf_counter(),
+        )
+
+        self._freeze_source_expectations()
+        self._progress_notifications_once()
+        if self._sync_protocol_state.consume_ready(key):
+            self._record_ready_wait(request)
+            self._post_sync_read(request)
+            return
+
+        self._pending_reads[key] = request
+        self._sync_protocol_state.arm_deadline(_NixlEplbDeadlinePhase.READY, key)
+
+    def _make_transfer_key(
+        self,
+        *,
+        expert_id: int,
+        source: int,
+        reader: int,
+    ) -> _NixlEplbTransferKey:
+        generation = self._sync_protocol_state.active_generation
+        if generation is None or self._layer_idx is None:
+            raise RuntimeError(
+                "set_transfer_context() must be called before NIXL EPLB transfers"
+            )
+        return _NixlEplbTransferKey(
+            generation=generation,
+            layer=self._layer_idx,
+            expert=expert_id,
+            source=source,
+            reader=reader,
+        )
+
+    def _build_read_descs(
+        self,
+        tensors: list[torch.Tensor],
+        src_rank: int,
+        expert_id: int,
+    ) -> tuple[list[tuple[int, int, int]], list[tuple[int, int, int]]]:
+        assert self._expert_to_src_row is not None and self._layer_idx is not None
         src_row = self._expert_to_src_row[src_rank][expert_id]
         layer_idx = self._layer_idx
 
@@ -822,14 +946,23 @@ class NixlEplbCommunicator(EplbCommunicator):
                     remote_dev,
                 )
             )
+        return local_descs, remote_descs
 
-        post_started = time.perf_counter() if self._sync_protocol_active else None
+    def _post_legacy_read(
+        self,
+        tensors: list[torch.Tensor],
+        src_rank: int,
+        expert_id: int,
+    ) -> None:
+        local_descs, remote_descs = self._build_read_descs(
+            tensors,
+            src_rank,
+            expert_id,
+        )
         local_h, remote_h, xfer_h = self._create_peer_xfer(
             src_rank, local_descs, remote_descs
         )
         self._nixl_wrapper.transfer(xfer_h)
-        if post_started is not None:
-            self._pending_read_post_seconds += time.perf_counter() - post_started
         self._xfer_entries.append((local_h, remote_h, xfer_h))
 
     def _init_remote_agents(self) -> None:
@@ -908,6 +1041,246 @@ class NixlEplbCommunicator(EplbCommunicator):
                     )
             self._remote_send_meta[peer] = peer_meta
 
+    def _freeze_source_expectations(self) -> None:
+        if self._source_expectations_frozen:
+            return
+        for key, readers in self._source_readers.items():
+            self._sync_protocol_state.set_expected_readers(key, list(readers))
+            if readers:
+                self._sync_protocol_state.arm_deadline(
+                    _NixlEplbDeadlinePhase.READ_DONE,
+                    key,
+                )
+        self._source_expectations_frozen = True
+
+    def _progress_notifications_once(self) -> bool:
+        assert self._source_expectations_frozen
+        assert self._sync_stats is not None
+        made_progress = self._process_deferred_notifications()
+        self._sync_stats.notification_poll_calls += 1
+        notifications = self._nixl_wrapper.get_new_notifs()
+        for sender_name, payloads in notifications.items():
+            normalized_name = _normalize_nixl_agent_name(sender_name)
+            sender_rank = self._remote_agent_ranks.get(normalized_name)
+            if sender_rank is None:
+                raise RuntimeError(
+                    "NIXL EPLB notification from unknown agent: "
+                    f"agent={normalized_name!r}"
+                )
+            for payload in payloads:
+                notification = _NixlEplbNotification.decode(payload)
+                made_progress = (
+                    self._record_or_defer_notification(notification, sender_rank)
+                    or made_progress
+                )
+        return self._post_ready_reads() or made_progress
+
+    def _process_deferred_notifications(self) -> bool:
+        generation = self._sync_protocol_state.active_generation
+        assert generation is not None
+        deferred = self._deferred_notifications.pop(generation, ())
+        for notification, sender_rank in deferred:
+            self._record_notification(notification, sender_rank)
+        return bool(deferred)
+
+    def _record_or_defer_notification(
+        self,
+        notification: _NixlEplbNotification,
+        sender_rank: int,
+    ) -> bool:
+        notification.validate_route(sender_rank, self._rank)
+        active_generation = self._sync_protocol_state.active_generation
+        assert active_generation is not None
+        if notification.key.generation > active_generation:
+            self._deferred_notifications.setdefault(
+                notification.key.generation,
+                [],
+            ).append((notification, sender_rank))
+            return True
+        self._record_notification(notification, sender_rank)
+        return True
+
+    def _record_notification(
+        self,
+        notification: _NixlEplbNotification,
+        sender_rank: int,
+    ) -> None:
+        assert self._sync_stats is not None
+        disposition = self._sync_protocol_state.record_notification(
+            notification,
+            sender_rank,
+        )
+        if disposition == _NixlEplbNotificationDisposition.DUPLICATE:
+            self._sync_stats.duplicate_notifications += 1
+            return
+        if disposition == _NixlEplbNotificationDisposition.STALE:
+            self._sync_stats.stale_notifications += 1
+            return
+        if notification.kind == _NixlEplbNotificationKind.READY:
+            self._sync_stats.ready_received += 1
+            return
+
+        self._sync_stats.read_done_received += 1
+        started_at = self._ready_sent_at.pop(notification.key, None)
+        if started_at is not None:
+            elapsed = time.perf_counter() - started_at
+            self._sync_stats.read_done_wait_sum_seconds += elapsed
+            self._sync_stats.read_done_wait_max_seconds = max(
+                self._sync_stats.read_done_wait_max_seconds,
+                elapsed,
+            )
+        source_key = notification.key.source_key
+        if self._sync_protocol_state.source_complete(source_key):
+            self._sync_protocol_state.clear_deadline(
+                _NixlEplbDeadlinePhase.READ_DONE,
+                source_key,
+            )
+
+    def _post_ready_reads(self) -> bool:
+        made_progress = False
+        for key, request in list(self._pending_reads.items()):
+            if not self._sync_protocol_state.consume_ready(key):
+                continue
+            del self._pending_reads[key]
+            self._sync_protocol_state.clear_deadline(
+                _NixlEplbDeadlinePhase.READY,
+                key,
+            )
+            self._record_ready_wait(request)
+            self._post_sync_read(request)
+            made_progress = True
+        return made_progress
+
+    def _record_ready_wait(self, request: _NixlEplbPendingRead) -> None:
+        assert self._sync_stats is not None
+        elapsed = time.perf_counter() - request.queued_at
+        self._sync_stats.ready_wait_sum_seconds += elapsed
+        self._sync_stats.ready_wait_max_seconds = max(
+            self._sync_stats.ready_wait_max_seconds,
+            elapsed,
+        )
+
+    def _post_sync_read(self, request: _NixlEplbPendingRead) -> None:
+        assert self._sync_stats is not None
+        post_started = time.perf_counter()
+        local_h: int | None = None
+        remote_h: int | None = None
+        xfer_h: int | None = None
+        try:
+            local_descs, remote_descs = self._build_read_descs(
+                request.tensors,
+                request.key.source,
+                request.key.expert,
+            )
+            read_done = _NixlEplbNotification(
+                _NixlEplbNotificationKind.READ_DONE,
+                request.key,
+            )
+            local_h, remote_h, xfer_h = self._create_peer_xfer(
+                request.key.source,
+                local_descs,
+                remote_descs,
+                notif_msg=read_done.encode(),
+            )
+            read_started = time.perf_counter()
+            state = self._nixl_wrapper.transfer(xfer_h)
+            if state not in ("DONE", "PROC"):
+                raise RuntimeError(f"NIXL transfer failed with state={state}")
+            self._sync_protocol_state.arm_deadline(
+                _NixlEplbDeadlinePhase.READ,
+                request.key,
+            )
+            self._active_reads[request.key] = _NixlEplbActiveRead(
+                key=request.key,
+                local_dlist=local_h,
+                remote_dlist=remote_h,
+                xfer_handle=xfer_h,
+                posted_at=read_started,
+                state=state,
+            )
+            self._sync_stats.reads_posted += 1
+            self._sync_stats.read_done_attached += 1
+        except Exception:
+            if xfer_h is not None:
+                with contextlib.suppress(Exception):
+                    self._nixl_wrapper.release_xfer_handle(xfer_h)
+            if local_h is not None:
+                with contextlib.suppress(Exception):
+                    self._nixl_wrapper.release_dlist_handle(local_h)
+            if remote_h is not None:
+                with contextlib.suppress(Exception):
+                    self._nixl_wrapper.release_dlist_handle(remote_h)
+            raise
+        finally:
+            self._sync_stats.read_post_seconds += time.perf_counter() - post_started
+
+    def _progress_active_reads(self) -> bool:
+        assert self._sync_stats is not None
+        made_progress = False
+        for key, entry in list(self._active_reads.items()):
+            state = entry.state
+            if state == "PROC":
+                progress_started = time.perf_counter()
+                try:
+                    state = self._nixl_wrapper.check_xfer_state(entry.xfer_handle)
+                finally:
+                    self._sync_stats.read_progress_seconds += (
+                        time.perf_counter() - progress_started
+                    )
+                entry.state = state
+            if state == "PROC":
+                continue
+            if state != "DONE":
+                raise RuntimeError(f"NIXL transfer failed with state={state}")
+
+            elapsed = time.perf_counter() - entry.posted_at
+            self._sync_stats.read_completion_sum_seconds += elapsed
+            self._sync_stats.read_completion_max_seconds = max(
+                self._sync_stats.read_completion_max_seconds,
+                elapsed,
+            )
+            self._sync_protocol_state.clear_deadline(
+                _NixlEplbDeadlinePhase.READ,
+                key,
+            )
+            self._release_active_read(entry)
+            del self._active_reads[key]
+            made_progress = True
+        return made_progress
+
+    def _release_active_read(self, entry: _NixlEplbActiveRead) -> None:
+        with contextlib.suppress(Exception):
+            self._nixl_wrapper.release_xfer_handle(entry.xfer_handle)
+        with contextlib.suppress(Exception):
+            self._nixl_wrapper.release_dlist_handle(entry.local_dlist)
+        with contextlib.suppress(Exception):
+            self._nixl_wrapper.release_dlist_handle(entry.remote_dlist)
+
+    def _sync_work_complete(self) -> bool:
+        if self._pending_reads or self._active_reads:
+            return False
+        return all(
+            self._sync_protocol_state.source_complete(key)
+            for key in self._source_readers
+        )
+
+    def _raise_for_unmatched_ready(self) -> None:
+        unmatched = self._sync_protocol_state.ready_tokens()
+        if unmatched:
+            raise RuntimeError(
+                "NIXL EPLB received READY without matching add_recv(): "
+                f"keys={sorted(unmatched, key=repr)}"
+            )
+
+    def _raise_for_expired_deadlines(self) -> None:
+        expired = self._sync_protocol_state.expired_deadlines()
+        if not expired:
+            return
+        details = ", ".join(
+            f"phase={deadline.phase.value}, key={deadline.key}" for deadline in expired
+        )
+        raise RuntimeError(f"NIXL EPLB synchronous protocol timed out: {details}")
+
     def _wait_for_all_transfers(self, handles: list[int]) -> None:
         pending = set(handles)
         while pending:
@@ -929,6 +1302,7 @@ class NixlEplbCommunicator(EplbCommunicator):
         src: int,
         local_descs: list[tuple[int, int, int]],
         remote_descs: list[tuple[int, int, int]],
+        notif_msg: bytes | None = None,
     ) -> tuple[int, int, int]:
         """Create a batched xfer for multiple descriptors from one peer.
 
@@ -954,13 +1328,23 @@ class NixlEplbCommunicator(EplbCommunicator):
         )
 
         indices = list(range(len(local_descs)))
-        xfer_handle = self._nixl_wrapper.make_prepped_xfer(
-            "READ",
-            local_handle,
-            indices,
-            remote_handle,
-            indices,
-        )
+        if notif_msg is None:
+            xfer_handle = self._nixl_wrapper.make_prepped_xfer(
+                "READ",
+                local_handle,
+                indices,
+                remote_handle,
+                indices,
+            )
+        else:
+            xfer_handle = self._nixl_wrapper.make_prepped_xfer(
+                "READ",
+                local_handle,
+                indices,
+                remote_handle,
+                indices,
+                notif_msg=notif_msg,
+            )
         return (local_handle, remote_handle, xfer_handle)
 
     def _post_read_barrier(self) -> None:
@@ -987,14 +1371,25 @@ class NixlEplbCommunicator(EplbCommunicator):
             with contextlib.suppress(Exception):
                 self._nixl_wrapper.release_dlist_handle(remote_h)
         self._xfer_entries.clear()
+        for entry in self._active_reads.values():
+            self._release_active_read(entry)
+        self._active_reads.clear()
+        self._pending_reads.clear()
+        self._recv_keys.clear()
+        self._source_readers.clear()
+        self._ready_sent_at.clear()
+        self._source_expectations_frozen = False
+        self._sync_stats = None
         self._expert_to_src_row = None
         self._layer_idx = None
-        self._pending_read_post_seconds = 0.0
 
     def execute(self) -> None:
-        assert self._layer_idx is not None or not self._xfer_entries, (
+        has_transfers = bool(
+            self._xfer_entries or self._pending_reads or self._active_reads
+        )
+        assert self._layer_idx is not None or not has_transfers, (
             "set_transfer_context() must be called before execute() "
-            "if any add_recv() calls were made"
+            "if any transfers were added"
         )
         if not self._sync_protocol_active:
             try:
@@ -1004,39 +1399,64 @@ class NixlEplbCommunicator(EplbCommunicator):
                 self._clear_transfer_state()
             return
 
-        stats = _NixlEplbExecuteStats(
-            sync_protocol_active=self._sync_protocol_active,
-            reads_posted=len(self._xfer_entries),
-            read_post_seconds=self._pending_read_post_seconds,
-        )
+        if self._layer_idx is None or self._sync_stats is None:
+            raise RuntimeError(
+                "set_transfer_context() must be called before synchronous "
+                "NIXL EPLB execute()"
+            )
+        stats = self._sync_stats
+        generation = self._sync_protocol_state.active_generation
+        assert generation is not None
         execute_started = time.perf_counter()
+        success = False
         try:
-            progress_started = time.perf_counter()
-            try:
-                self._wait_for_all_transfers([x[2] for x in self._xfer_entries])
-            finally:
-                stats.read_progress_seconds = time.perf_counter() - progress_started
-
-            barrier_started = time.perf_counter()
-            try:
-                self._post_read_barrier()
-            finally:
-                stats.barrier_seconds = time.perf_counter() - barrier_started
+            self._freeze_source_expectations()
+            while True:
+                made_progress = self._progress_notifications_once()
+                self._raise_for_unmatched_ready()
+                made_progress = self._progress_active_reads() or made_progress
+                if self._sync_work_complete():
+                    success = True
+                    break
+                self._raise_for_expired_deadlines()
+                if not made_progress:
+                    time.sleep(0.0005)
         finally:
+            self._sync_protocol_state.end_generation(success=success)
             self._clear_transfer_state()
             stats.execute_seconds = time.perf_counter() - execute_started
             self._last_execute_stats = stats
             logger.debug(
-                "NIXL EPLB execute stats: rank=%d sync_protocol=%s reads=%d "
-                "execute_ms=%.3f read_post_ms=%.3f read_progress_ms=%.3f "
-                "barrier_ms=%.3f",
+                "NIXL EPLB execute stats: rank=%d generation=%d "
+                "sync_protocol=%s reads=%d execute_ms=%.3f "
+                "ready_wait_sum_ms=%.3f ready_wait_max_ms=%.3f "
+                "read_post_ms=%.3f read_progress_ms=%.3f "
+                "read_completion_sum_ms=%.3f read_completion_max_ms=%.3f "
+                "read_done_wait_sum_ms=%.3f read_done_wait_max_ms=%.3f "
+                "barrier_ms=%.3f ready_sent=%d ready_received=%d "
+                "read_done_attached=%d read_done_received=%d "
+                "duplicate_notifications=%d stale_notifications=%d polls=%d",
                 self._rank,
+                generation,
                 stats.sync_protocol_active,
                 stats.reads_posted,
                 stats.execute_seconds * 1000,
+                stats.ready_wait_sum_seconds * 1000,
+                stats.ready_wait_max_seconds * 1000,
                 stats.read_post_seconds * 1000,
                 stats.read_progress_seconds * 1000,
+                stats.read_completion_sum_seconds * 1000,
+                stats.read_completion_max_seconds * 1000,
+                stats.read_done_wait_sum_seconds * 1000,
+                stats.read_done_wait_max_seconds * 1000,
                 stats.barrier_seconds * 1000,
+                stats.ready_sent,
+                stats.ready_received,
+                stats.read_done_attached,
+                stats.read_done_received,
+                stats.duplicate_notifications,
+                stats.stale_notifications,
+                stats.notification_poll_calls,
             )
 
     def __del__(self) -> None:
@@ -1048,6 +1468,8 @@ class NixlEplbCommunicator(EplbCommunicator):
                     self._nixl_wrapper.release_dlist_handle(local_h)
                 with contextlib.suppress(Exception):
                     self._nixl_wrapper.release_dlist_handle(remote_h)
+            for entry in self._active_reads.values():
+                self._release_active_read(entry)
         with contextlib.suppress(Exception):
             for descs in self._registered_descs:
                 with contextlib.suppress(Exception):

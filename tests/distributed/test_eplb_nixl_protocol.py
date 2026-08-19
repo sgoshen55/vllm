@@ -37,6 +37,15 @@ class FakeNixlAgent:
         self.names_as_bytes = names_as_bytes
         self.released_xfers: list[int] = []
         self.released_dlists: list[int] = []
+        self.sent_notifications: list[tuple[str | bytes, bytes]] = []
+        self.notifications: dict[str | bytes, list[bytes]] = {}
+        self.poll_calls = 0
+        self.transfer_calls: list[int] = []
+        self.check_calls: list[int] = []
+        self.prepped_xfers: list[dict[str, object]] = []
+        self.transfer_state = "DONE"
+        self.check_states: list[str] = []
+        self._next_handle = 10
 
     def get_agent_metadata(self) -> bytes:
         return b"local"
@@ -47,11 +56,111 @@ class FakeNixlAgent:
     def remove_remote_agent(self, agent_name: str | bytes) -> None:
         pass
 
+    def send_notif(self, agent_name: str | bytes, notif_msg: bytes) -> None:
+        self.sent_notifications.append((agent_name, notif_msg))
+
+    def get_new_notifs(self) -> dict[str | bytes, list[bytes]]:
+        self.poll_calls += 1
+        notifications = self.notifications
+        self.notifications = {}
+        return notifications
+
+    def get_xfer_descs(self, descs, memory_type):
+        assert memory_type == "VRAM"
+        return descs
+
+    def prep_xfer_dlist(self, agent_name, descs):
+        handle = self._next_handle
+        self._next_handle += 1
+        return handle
+
+    def make_prepped_xfer(
+        self,
+        operation,
+        local_handle,
+        local_indices,
+        remote_handle,
+        remote_indices,
+        notif_msg=None,
+    ) -> int:
+        handle = self._next_handle
+        self._next_handle += 1
+        self.prepped_xfers.append(
+            {
+                "operation": operation,
+                "local_handle": local_handle,
+                "local_indices": local_indices,
+                "remote_handle": remote_handle,
+                "remote_indices": remote_indices,
+                "notif_msg": notif_msg,
+                "xfer_handle": handle,
+            }
+        )
+        return handle
+
+    def transfer(self, handle: int) -> str:
+        self.transfer_calls.append(handle)
+        return self.transfer_state
+
+    def check_xfer_state(self, handle: int) -> str:
+        self.check_calls.append(handle)
+        if self.check_states:
+            return self.check_states.pop(0)
+        return self.transfer_state
+
     def release_xfer_handle(self, handle: int) -> None:
         self.released_xfers.append(handle)
 
     def release_dlist_handle(self, handle: int) -> None:
         self.released_dlists.append(handle)
+
+
+def make_fake_tensor(address: int = 2000, nbytes: int = 16):
+    return SimpleNamespace(nbytes=nbytes, data_ptr=lambda: address)
+
+
+def make_sync_communicator(
+    *,
+    rank: int,
+    agent: FakeNixlAgent,
+    generation: int = 7,
+    layer: int = 3,
+) -> NixlEplbCommunicator:
+    peer = 1 - rank
+    communicator = object.__new__(NixlEplbCommunicator)
+    communicator._rank = rank
+    communicator._world_size = 2
+    communicator._sync_protocol_active = True
+    communicator._sync_protocol_state = _NixlEplbProtocolState(
+        local_rank=rank,
+        world_size=2,
+    )
+    communicator._sync_protocol_state.begin_generation(generation)
+    communicator._next_sync_generation = generation + 1
+    communicator._sync_stats = eplb_communicator._NixlEplbExecuteStats(
+        sync_protocol_active=True
+    )
+    communicator._xfer_entries = []
+    communicator._pending_reads = {}
+    communicator._active_reads = {}
+    communicator._recv_keys = set()
+    communicator._source_readers = {}
+    communicator._source_expectations_frozen = False
+    communicator._ready_sent_at = {}
+    communicator._deferred_notifications = {}
+    communicator._last_execute_stats = None
+    communicator._expert_to_src_row = [{11: 0}, {11: 0}]
+    communicator._layer_idx = layer
+    communicator._nixl_wrapper = agent
+    communicator._nixl_memory_type = "VRAM"
+    communicator._cuda_device_id = rank
+    communicator._remote_agents = {peer: f"peer-{peer}"}
+    communicator._remote_agent_ranks = {f"peer-{peer}": peer}
+    communicator._remote_send_meta = {
+        peer: {(layer, 0): (1000, 16, peer)},
+    }
+    communicator._registered_descs = []
+    return communicator
 
 
 class FakeGroupCoordinator:
@@ -251,56 +360,222 @@ def test_sync_protocol_activation_is_requested_and_non_elastic(
     assert constructor_args["enable_sync_protocol"] is expected
 
 
-def test_legacy_execute_records_baseline_stats(
+def test_add_send_publishes_ready_immediately() -> None:
+    agent = FakeNixlAgent()
+    communicator = make_sync_communicator(rank=0, agent=agent)
+
+    communicator.add_send([], dst_rank=1, expert_id=11)
+
+    assert len(agent.sent_notifications) == 1
+    peer, payload = agent.sent_notifications[0]
+    assert peer == "peer-1"
+    assert _NixlEplbNotification.decode(payload) == _NixlEplbNotification(
+        _NixlEplbNotificationKind.READY,
+        make_transfer_key(),
+    )
+    assert agent.poll_calls == 0
+    assert agent.transfer_calls == []
+    assert communicator._sync_stats is not None
+    assert communicator._sync_stats.ready_sent == 1
+
+
+def test_add_recv_polls_once_and_queues_when_ready_is_absent() -> None:
+    agent = FakeNixlAgent()
+    communicator = make_sync_communicator(rank=1, agent=agent)
+
+    communicator.add_recv(
+        [make_fake_tensor()],  # type: ignore[list-item]
+        src_rank=0,
+        expert_id=11,
+    )
+
+    assert set(communicator._pending_reads) == {make_transfer_key()}
+    assert communicator._active_reads == {}
+    assert agent.poll_calls == 1
+    assert agent.transfer_calls == []
+    assert agent.check_calls == []
+
+
+def test_add_recv_posts_read_without_waiting_when_ready_is_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    clock = FakeClock()
     agent = FakeNixlAgent()
-    communicator = object.__new__(NixlEplbCommunicator)
-    communicator._rank = 0
-    communicator._sync_protocol_active = True
-    communicator._xfer_entries = [(10, 20, 30)]
-    communicator._pending_read_post_seconds = 1.5
-    communicator._expert_to_src_row = [{}]
-    communicator._layer_idx = 4
-    communicator._nixl_wrapper = agent
-    events = []
-
-    def wait_for_all_transfers(handles: list[int]) -> None:
-        events.append(("wait", handles))
-        clock.advance(2)
-
-    def post_read_barrier() -> None:
-        events.append(("barrier", None))
-        clock.advance(3)
-
-    monkeypatch.setattr(eplb_communicator.time, "perf_counter", clock)
+    communicator = make_sync_communicator(rank=1, agent=agent)
+    ready = _NixlEplbNotification(
+        _NixlEplbNotificationKind.READY,
+        make_transfer_key(),
+    )
+    agent.notifications = {"peer-0": [ready.encode()]}
     monkeypatch.setattr(
         communicator,
-        "_wait_for_all_transfers",
-        wait_for_all_transfers,
+        "_post_read_barrier",
+        lambda: pytest.fail("synchronous notification protocol must not barrier"),
     )
-    monkeypatch.setattr(communicator, "_post_read_barrier", post_read_barrier)
+
+    communicator.add_recv(
+        [make_fake_tensor()],  # type: ignore[list-item]
+        src_rank=0,
+        expert_id=11,
+    )
+
+    assert communicator._pending_reads == {}
+    assert set(communicator._active_reads) == {make_transfer_key()}
+    assert agent.poll_calls == 1
+    assert len(agent.transfer_calls) == 1
+    assert agent.check_calls == []
+    read_done_payload = agent.prepped_xfers[0]["notif_msg"]
+    assert isinstance(read_done_payload, bytes)
+    assert _NixlEplbNotification.decode(read_done_payload) == _NixlEplbNotification(
+        _NixlEplbNotificationKind.READ_DONE,
+        make_transfer_key(),
+    )
 
     communicator.execute()
 
     stats = communicator._last_execute_stats
     assert stats is not None
-    assert stats.sync_protocol_active
     assert stats.reads_posted == 1
-    assert stats.read_post_seconds == 1.5
-    assert stats.read_progress_seconds == 2
-    assert stats.barrier_seconds == 3
-    assert stats.execute_seconds == 5
-    assert stats.ready_sent == 0
-    assert stats.ready_received == 0
-    assert stats.read_done_attached == 0
-    assert stats.read_done_received == 0
-    assert events == [("wait", [30]), ("barrier", None)]
-    assert agent.released_xfers == [30]
-    assert agent.released_dlists == [10, 20]
-    assert communicator._xfer_entries == []
-    assert communicator._pending_read_post_seconds == 0
+    assert stats.ready_received == 1
+    assert stats.read_done_attached == 1
+    assert stats.barrier_seconds == 0
+    assert agent.check_calls == []
+
+
+def test_execute_matches_late_ready_and_completes_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = FakeNixlAgent()
+    communicator = make_sync_communicator(rank=1, agent=agent)
+    communicator.add_recv(
+        [make_fake_tensor()],  # type: ignore[list-item]
+        src_rank=0,
+        expert_id=11,
+    )
+    ready = _NixlEplbNotification(
+        _NixlEplbNotificationKind.READY,
+        make_transfer_key(),
+    )
+    agent.notifications = {"peer-0": [ready.encode()]}
+    monkeypatch.setattr(
+        communicator,
+        "_post_read_barrier",
+        lambda: pytest.fail("synchronous notification protocol must not barrier"),
+    )
+
+    communicator.execute()
+
+    assert communicator._last_execute_stats is not None
+    assert communicator._last_execute_stats.reads_posted == 1
+    assert communicator._last_execute_stats.notification_poll_calls == 2
+    assert len(agent.transfer_calls) == 1
+
+
+def test_read_completion_is_progressed_only_by_execute() -> None:
+    agent = FakeNixlAgent()
+    agent.transfer_state = "PROC"
+    agent.check_states = ["PROC", "DONE"]
+    communicator = make_sync_communicator(rank=1, agent=agent)
+    ready = _NixlEplbNotification(
+        _NixlEplbNotificationKind.READY,
+        make_transfer_key(),
+    )
+    agent.notifications = {"peer-0": [ready.encode()]}
+
+    communicator.add_recv(
+        [make_fake_tensor()],  # type: ignore[list-item]
+        src_rank=0,
+        expert_id=11,
+    )
+
+    assert agent.check_calls == []
+
+    communicator.execute()
+
+    assert len(agent.check_calls) == 2
+    assert communicator._last_execute_stats is not None
+    assert communicator._last_execute_stats.read_completion_sum_seconds > 0
+
+
+def test_future_ready_is_deferred_until_its_generation() -> None:
+    agent = FakeNixlAgent()
+    communicator = make_sync_communicator(rank=1, agent=agent)
+    future_key = make_transfer_key(generation=8, layer=4)
+    future_ready = _NixlEplbNotification(
+        _NixlEplbNotificationKind.READY,
+        future_key,
+    )
+    agent.notifications = {"peer-0": [future_ready.encode()]}
+
+    communicator.execute()
+
+    assert communicator._deferred_notifications == {
+        8: [(future_ready, 0)],
+    }
+
+    communicator._layer_idx = 4
+    communicator._expert_to_src_row = [{11: 0}, {11: 0}]
+    communicator._remote_send_meta[0][(4, 0)] = (1000, 16, 0)
+    communicator._sync_protocol_state.begin_generation(8)
+    communicator._sync_stats = eplb_communicator._NixlEplbExecuteStats(
+        sync_protocol_active=True
+    )
+    communicator.add_recv(
+        [make_fake_tensor()],  # type: ignore[list-item]
+        src_rank=0,
+        expert_id=11,
+    )
+
+    assert communicator._deferred_notifications == {}
+    assert set(communicator._active_reads) == {future_key}
+    communicator.execute()
+
+
+def test_execute_waits_for_every_expected_read_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = FakeNixlAgent()
+    communicator = make_sync_communicator(rank=0, agent=agent)
+    communicator.add_send([], dst_rank=1, expert_id=11)
+    read_done = _NixlEplbNotification(
+        _NixlEplbNotificationKind.READ_DONE,
+        make_transfer_key(),
+    )
+    agent.notifications = {"peer-1": [read_done.encode()]}
+    monkeypatch.setattr(
+        communicator,
+        "_post_read_barrier",
+        lambda: pytest.fail("synchronous notification protocol must not barrier"),
+    )
+
+    communicator.execute()
+
+    stats = communicator._last_execute_stats
+    assert stats is not None
+    assert stats.ready_sent == 1
+    assert stats.read_done_received == 1
+    assert stats.barrier_seconds == 0
+
+
+def test_execute_times_out_when_ready_never_arrives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    agent = FakeNixlAgent()
+    communicator = make_sync_communicator(rank=1, agent=agent)
+    communicator._sync_protocol_state._clock = clock
+    communicator._sync_protocol_state.timeout_seconds = 1
+    communicator.add_recv(
+        [make_fake_tensor()],  # type: ignore[list-item]
+        src_rank=0,
+        expert_id=11,
+    )
+    monkeypatch.setattr(eplb_communicator.time, "sleep", clock.advance)
+
+    with pytest.raises(RuntimeError, match="missing READY"):
+        communicator.execute()
+
+    assert communicator._sync_protocol_state.active_generation is None
+    assert communicator._pending_reads == {}
 
 
 def test_non_sync_execute_keeps_legacy_path_uninstrumented(
@@ -309,7 +584,13 @@ def test_non_sync_execute_keeps_legacy_path_uninstrumented(
     communicator = object.__new__(NixlEplbCommunicator)
     communicator._sync_protocol_active = False
     communicator._xfer_entries = []
-    communicator._pending_read_post_seconds = 0.0
+    communicator._pending_reads = {}
+    communicator._active_reads = {}
+    communicator._recv_keys = set()
+    communicator._source_readers = {}
+    communicator._ready_sent_at = {}
+    communicator._source_expectations_frozen = False
+    communicator._sync_stats = None
     communicator._last_execute_stats = None
     communicator._expert_to_src_row = None
     communicator._layer_idx = None
@@ -335,6 +616,38 @@ def test_non_sync_execute_keeps_legacy_path_uninstrumented(
     communicator.execute()
 
     assert events == [("wait", []), ("barrier", None)]
+    assert communicator._last_execute_stats is None
+
+
+def test_non_sync_add_recv_keeps_legacy_transfer_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = FakeNixlAgent()
+    communicator = make_sync_communicator(rank=1, agent=agent)
+    communicator._sync_protocol_active = False
+    communicator._sync_protocol_state.end_generation(success=False)
+    communicator._sync_stats = None
+    barriers = []
+    monkeypatch.setattr(
+        communicator,
+        "_post_read_barrier",
+        lambda: barriers.append(True),
+    )
+
+    communicator.add_recv(
+        [make_fake_tensor()],  # type: ignore[list-item]
+        src_rank=0,
+        expert_id=11,
+    )
+
+    assert agent.poll_calls == 0
+    assert agent.sent_notifications == []
+    assert len(agent.transfer_calls) == 1
+    assert agent.prepped_xfers[0]["notif_msg"] is None
+
+    communicator.execute()
+
+    assert barriers == [True]
     assert communicator._last_execute_stats is None
 
 
