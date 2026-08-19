@@ -353,6 +353,7 @@ def _test_nixl_read_completion_notification_worker(
         local_handle = None
         remote_handle = None
         xfer_handle = None
+        matching_senders: list[str] = []
 
         if rank == 1:
             source_info = gathered_info[0]
@@ -400,8 +401,10 @@ def _test_nixl_read_completion_notification_worker(
             while notification not in received and time.monotonic() < deadline:
                 notifications = agent.get_new_notifs(backends=["UCX"])
                 for sender, payloads in notifications.items():
-                    assert sender == peer_agent_name
-                    received.extend(payloads)
+                    for payload in payloads:
+                        if payload == notification:
+                            matching_senders.append(sender)
+                            received.append(payload)
                 if notification not in received:
                     time.sleep(0.0005)
             assert received == [notification]
@@ -428,6 +431,11 @@ def _test_nixl_read_completion_notification_worker(
             agent.release_dlist_handle(remote_handle)
         agent.deregister_memory(registration, backends=["UCX"])
         agent.remove_remote_agent(peer_agent_name)
+        if rank == 0:
+            assert matching_senders == [peer_agent_name], (
+                "NIXL READ notification sender mismatch: "
+                f"actual={matching_senders!r}, expected={[peer_agent_name]!r}"
+            )
 
 
 @pytest.mark.skipif(
