@@ -292,6 +292,7 @@ def create_eplb_communicator_or_raise(
             backend=backend,
             expert_weights=expert_weights,
             expert_buffer=expert_buffer,
+            enable_nixl_sync_protocol=True,
         )
     except Exception as exc:
         raise RuntimeError(

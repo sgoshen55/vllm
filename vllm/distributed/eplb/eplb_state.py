@@ -471,6 +471,7 @@ class EplbState:
             backend=self.parallel_config.eplb_config.communicator,
             expert_weights=model.expert_weights,
             expert_buffer=expert_buffer,
+            enable_nixl_sync_protocol=not self.is_async,
         )
 
         model_state = EplbModelState(

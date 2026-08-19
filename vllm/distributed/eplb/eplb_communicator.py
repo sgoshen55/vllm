@@ -201,6 +201,31 @@ class _NixlEplbDeadline:
     expires_at: float
 
 
+@dataclass(slots=True)
+class _NixlEplbExecuteStats:
+    """Per-execute timings and counters for NIXL EPLB."""
+
+    sync_protocol_active: bool
+    reads_posted: int = 0
+    execute_seconds: float = 0.0
+    ready_wait_sum_seconds: float = 0.0
+    ready_wait_max_seconds: float = 0.0
+    read_post_seconds: float = 0.0
+    read_progress_seconds: float = 0.0
+    read_completion_sum_seconds: float = 0.0
+    read_completion_max_seconds: float = 0.0
+    read_done_wait_sum_seconds: float = 0.0
+    read_done_wait_max_seconds: float = 0.0
+    barrier_seconds: float = 0.0
+    ready_sent: int = 0
+    ready_received: int = 0
+    read_done_attached: int = 0
+    read_done_received: int = 0
+    duplicate_notifications: int = 0
+    stale_notifications: int = 0
+    notification_poll_calls: int = 0
+
+
 class _NixlEplbProtocolState:
     """Pure state for the synchronous notification protocol."""
 
@@ -609,6 +634,7 @@ class NixlEplbCommunicator(EplbCommunicator):
         all_expert_weights: Sequence[Sequence[torch.Tensor]],
         expert_buffer: Sequence[torch.Tensor],
         defer_remote_setup: bool = False,
+        enable_sync_protocol: bool = False,
     ) -> None:
         """Create a NIXL-backed EPLB communicator.
 
@@ -621,6 +647,8 @@ class NixlEplbCommunicator(EplbCommunicator):
                 ``set_transfer_context`` call.  Required for elastic EP
                 where ranks join asynchronously and cannot participate
                 in collectives at construction time.
+            enable_sync_protocol: Enable the synchronous notification
+                protocol. Ignored when remote setup is deferred for elastic EP.
         """
         assert all_expert_weights, (
             "NixlEplbCommunicator requires non-empty all_expert_weights."
@@ -656,6 +684,8 @@ class NixlEplbCommunicator(EplbCommunicator):
         # (local_dlist, remote_dlist, xfer_handle) for in-flight READs;
         # accumulated by add_recv, drained by execute.
         self._xfer_entries: list[tuple[int, int, int]] = []
+        self._pending_read_post_seconds = 0.0
+        self._last_execute_stats: _NixlEplbExecuteStats | None = None
         # Per-rank expert_id -> physical row; set by set_transfer_context.
         self._expert_to_src_row: list[dict[int, int]] | None = None
         self._layer_idx: int | None = None
@@ -677,9 +707,7 @@ class NixlEplbCommunicator(EplbCommunicator):
             int, dict[tuple[int, int], tuple[int, int, int]]
         ] = {}
 
-        # The synchronous lifecycle activates this state explicitly. Until then,
-        # all callers remain on the legacy path.
-        self._sync_protocol_active = False
+        self._sync_protocol_active = enable_sync_protocol and not defer_remote_setup
         self._sync_protocol_state = _NixlEplbProtocolState(
             local_rank=self._rank,
             world_size=self._world_size,
@@ -795,10 +823,13 @@ class NixlEplbCommunicator(EplbCommunicator):
                 )
             )
 
+        post_started = time.perf_counter() if self._sync_protocol_active else None
         local_h, remote_h, xfer_h = self._create_peer_xfer(
             src_rank, local_descs, remote_descs
         )
         self._nixl_wrapper.transfer(xfer_h)
+        if post_started is not None:
+            self._pending_read_post_seconds += time.perf_counter() - post_started
         self._xfer_entries.append((local_h, remote_h, xfer_h))
 
     def _init_remote_agents(self) -> None:
@@ -947,26 +978,66 @@ class NixlEplbCommunicator(EplbCommunicator):
         )
         work.wait(timeout=timedelta(minutes=5))
 
+    def _clear_transfer_state(self) -> None:
+        for local_h, remote_h, xfer_h in self._xfer_entries:
+            with contextlib.suppress(Exception):
+                self._nixl_wrapper.release_xfer_handle(xfer_h)
+            with contextlib.suppress(Exception):
+                self._nixl_wrapper.release_dlist_handle(local_h)
+            with contextlib.suppress(Exception):
+                self._nixl_wrapper.release_dlist_handle(remote_h)
+        self._xfer_entries.clear()
+        self._expert_to_src_row = None
+        self._layer_idx = None
+        self._pending_read_post_seconds = 0.0
+
     def execute(self) -> None:
         assert self._layer_idx is not None or not self._xfer_entries, (
             "set_transfer_context() must be called before execute() "
             "if any add_recv() calls were made"
         )
-        try:
-            self._wait_for_all_transfers([x[2] for x in self._xfer_entries])
+        if not self._sync_protocol_active:
+            try:
+                self._wait_for_all_transfers([x[2] for x in self._xfer_entries])
+                self._post_read_barrier()
+            finally:
+                self._clear_transfer_state()
+            return
 
-            self._post_read_barrier()
+        stats = _NixlEplbExecuteStats(
+            sync_protocol_active=self._sync_protocol_active,
+            reads_posted=len(self._xfer_entries),
+            read_post_seconds=self._pending_read_post_seconds,
+        )
+        execute_started = time.perf_counter()
+        try:
+            progress_started = time.perf_counter()
+            try:
+                self._wait_for_all_transfers([x[2] for x in self._xfer_entries])
+            finally:
+                stats.read_progress_seconds = time.perf_counter() - progress_started
+
+            barrier_started = time.perf_counter()
+            try:
+                self._post_read_barrier()
+            finally:
+                stats.barrier_seconds = time.perf_counter() - barrier_started
         finally:
-            for local_h, remote_h, xfer_h in self._xfer_entries:
-                with contextlib.suppress(Exception):
-                    self._nixl_wrapper.release_xfer_handle(xfer_h)
-                with contextlib.suppress(Exception):
-                    self._nixl_wrapper.release_dlist_handle(local_h)
-                with contextlib.suppress(Exception):
-                    self._nixl_wrapper.release_dlist_handle(remote_h)
-            self._xfer_entries.clear()
-            self._expert_to_src_row = None
-            self._layer_idx = None
+            self._clear_transfer_state()
+            stats.execute_seconds = time.perf_counter() - execute_started
+            self._last_execute_stats = stats
+            logger.debug(
+                "NIXL EPLB execute stats: rank=%d sync_protocol=%s reads=%d "
+                "execute_ms=%.3f read_post_ms=%.3f read_progress_ms=%.3f "
+                "barrier_ms=%.3f",
+                self._rank,
+                stats.sync_protocol_active,
+                stats.reads_posted,
+                stats.execute_seconds * 1000,
+                stats.read_post_seconds * 1000,
+                stats.read_progress_seconds * 1000,
+                stats.barrier_seconds * 1000,
+            )
 
     def __del__(self) -> None:
         with contextlib.suppress(Exception):
@@ -1039,6 +1110,7 @@ def create_eplb_communicator(
     backend: str,
     expert_weights: Sequence[Sequence[torch.Tensor]],
     expert_buffer: Sequence[torch.Tensor],
+    enable_nixl_sync_protocol: bool = False,
 ) -> EplbCommunicator:
     """Create an EPLB communicator for the given backend.
 
@@ -1060,6 +1132,8 @@ def create_eplb_communicator(
             zero-copy RDMA reads.
         expert_buffer: Pre-allocated receive buffer tensors (one per
             weight tensor in a single layer).
+        enable_nixl_sync_protocol: Enable the NIXL notification protocol for
+            synchronous EPLB. Stateless elastic groups always use the legacy path.
     """
     first_layer = expert_weights[0] if expert_weights else []
     tensor_device_type = first_layer[0].device.type if first_layer else "cpu"
@@ -1139,6 +1213,7 @@ def create_eplb_communicator(
                 all_expert_weights=expert_weights,
                 expert_buffer=expert_buffer,
                 defer_remote_setup=is_stateless,
+                enable_sync_protocol=(enable_nixl_sync_protocol and not is_stateless),
             )
         except Exception as exc:
             raise RuntimeError(
