@@ -284,7 +284,12 @@ def assert_verification_synced(local_ok: bool, msg: str) -> None:
 
 
 def create_eplb_communicator_or_raise(
-    *, group_coordinator, backend, expert_weights, expert_buffer
+    *,
+    group_coordinator,
+    backend,
+    expert_weights,
+    expert_buffer,
+    enable_nixl_sync_protocol: bool = False,
 ):
     try:
         return create_eplb_communicator(
@@ -292,7 +297,7 @@ def create_eplb_communicator_or_raise(
             backend=backend,
             expert_weights=expert_weights,
             expert_buffer=expert_buffer,
-            enable_nixl_sync_protocol=True,
+            enable_nixl_sync_protocol=enable_nixl_sync_protocol,
         )
     except Exception as exc:
         raise RuntimeError(
@@ -636,6 +641,7 @@ def _test_rearrange_expert_weights_with_redundancy(
             backend=eplb_communicator,
             expert_weights=expert_weights,
             expert_buffer=expert_buffer,
+            enable_nixl_sync_protocol=True,
         )
 
         # Execute weight rearrangement
