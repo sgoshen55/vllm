@@ -30,13 +30,16 @@ class FakeClock:
 
 
 class FakeNixlAgent:
+    def __init__(self, names_as_bytes: bool = False) -> None:
+        self.names_as_bytes = names_as_bytes
+
     def get_agent_metadata(self) -> bytes:
         return b"local"
 
-    def add_remote_agent(self, metadata: bytes) -> str:
-        return metadata.decode()
+    def add_remote_agent(self, metadata: bytes) -> str | bytes:
+        return metadata if self.names_as_bytes else metadata.decode()
 
-    def remove_remote_agent(self, agent_name: str) -> None:
+    def remove_remote_agent(self, agent_name: str | bytes) -> None:
         pass
 
 
@@ -141,12 +144,16 @@ def test_notification_route_matches_kind(
         notification.validate_route(receiver, sender)
 
 
-def test_remote_agent_names_map_back_to_ranks(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("names_as_bytes", [False, True])
+def test_remote_agent_names_map_back_to_ranks(
+    monkeypatch: pytest.MonkeyPatch,
+    names_as_bytes: bool,
+) -> None:
     communicator = object.__new__(NixlEplbCommunicator)
     communicator._rank = 0
     communicator._world_size = 3
     communicator._cpu_group = object()
-    communicator._nixl_wrapper = FakeNixlAgent()
+    communicator._nixl_wrapper = FakeNixlAgent(names_as_bytes=names_as_bytes)
     communicator._remote_agents = {}
     communicator._remote_agent_ranks = {}
 
@@ -163,7 +170,10 @@ def test_remote_agent_names_map_back_to_ranks(monkeypatch: pytest.MonkeyPatch) -
 
     communicator._init_remote_agents()
 
-    assert communicator._remote_agents == {1: "peer-1", 2: "peer-2"}
+    expected_handles = (
+        {1: b"peer-1", 2: b"peer-2"} if names_as_bytes else {1: "peer-1", 2: "peer-2"}
+    )
+    assert communicator._remote_agents == expected_handles
     assert communicator._remote_agent_ranks == {"peer-1": 1, "peer-2": 2}
 
 

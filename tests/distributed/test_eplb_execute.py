@@ -13,6 +13,7 @@ import torch.distributed
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import nixl_utils
 from vllm.distributed.eplb.eplb_communicator import (
+    _normalize_nixl_agent_name,
     create_eplb_communicator,
     has_nixl,
 )
@@ -347,7 +348,8 @@ def _test_nixl_read_completion_notification_worker(
         assert peer_info is not None
         peer_metadata = peer_info["metadata"]
         assert isinstance(peer_metadata, bytes)
-        peer_agent_name = agent.add_remote_agent(peer_metadata)
+        peer_agent_handle = agent.add_remote_agent(peer_metadata)
+        peer_agent_name = _normalize_nixl_agent_name(peer_agent_handle)
 
         notification = f"eplb-read-done:{run_id}".encode()
         local_handle = None
@@ -372,7 +374,7 @@ def _test_nixl_read_completion_notification_worker(
                 backends=["UCX"],
             )
             remote_handle = agent.prep_xfer_dlist(
-                peer_agent_name,
+                peer_agent_handle,
                 remote_descs,
                 backends=["UCX"],
             )
@@ -430,7 +432,7 @@ def _test_nixl_read_completion_notification_worker(
         if remote_handle is not None:
             agent.release_dlist_handle(remote_handle)
         agent.deregister_memory(registration, backends=["UCX"])
-        agent.remove_remote_agent(peer_agent_name)
+        agent.remove_remote_agent(peer_agent_handle)
         if rank == 0:
             assert matching_senders == [peer_agent_name], (
                 "NIXL READ notification sender mismatch: "

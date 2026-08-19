@@ -45,6 +45,12 @@ _NIXL_EPLB_NOTIFICATION_STRUCT = struct.Struct("!4sBBQIIIII")
 _NIXL_EPLB_DEFAULT_TIMEOUT_SECONDS = 300.0
 
 
+def _normalize_nixl_agent_name(agent_name: str | bytes) -> str:
+    if isinstance(agent_name, bytes):
+        return agent_name.decode()
+    return agent_name
+
+
 class _NixlEplbNotificationKind(IntEnum):
     READY = 1
     READ_DONE = 2
@@ -664,7 +670,7 @@ class NixlEplbCommunicator(EplbCommunicator):
         self._nixl_memory_type = "VRAM"
         # NIXL registration handles; deregistered in __del__.
         self._registered_descs: list[object] = []
-        self._remote_agents: dict[int, str] = {}
+        self._remote_agents: dict[int, str | bytes] = {}
         self._remote_agent_ranks: dict[str, int] = {}
         # peer -> (layer, tensor) -> (base_ptr, bytes_per_expert, dev_id).
         self._remote_send_meta: dict[
@@ -806,14 +812,15 @@ class NixlEplbCommunicator(EplbCommunicator):
                 continue
             peer_metadata = gathered_metadata[peer]
             assert peer_metadata is not None
-            agent_name = self._nixl_wrapper.add_remote_agent(peer_metadata)
+            agent_handle = self._nixl_wrapper.add_remote_agent(peer_metadata)
+            agent_name = _normalize_nixl_agent_name(agent_handle)
             previous_rank = self._remote_agent_ranks.get(agent_name)
             if previous_rank is not None:
                 raise RuntimeError(
                     "NIXL EPLB remote agent name is not unique: "
                     f"agent={agent_name!r}, ranks={previous_rank},{peer}"
                 )
-            self._remote_agents[peer] = agent_name
+            self._remote_agents[peer] = agent_handle
             self._remote_agent_ranks[agent_name] = peer
 
     def _init_registered_buffers(self) -> None:
