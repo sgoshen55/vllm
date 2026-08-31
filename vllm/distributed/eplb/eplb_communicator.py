@@ -9,6 +9,7 @@ import time
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from datetime import timedelta
 
 import numpy as np
@@ -35,6 +36,25 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class EplbPerfContext:
+    """Stable identifiers for one rank-local EPLB layer transfer."""
+
+    rearrangement_id: int
+    generation_id: int
+    layer_id: int
+    rank: int
+
+
+@dataclass(slots=True)
+class EplbBackendPerf:
+    """Backend timing fields captured by one communicator execution."""
+
+    fields: dict[str, int | float | str] = field(default_factory=dict)
+    gpu_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
+    read_payloads: list[tuple[int, int, int]] = field(default_factory=list)
 
 
 def has_nixl() -> bool:
@@ -72,14 +92,40 @@ class EplbCommunicator(ABC):
         On return, all data is available in the destination buffers.
         """
 
-    def set_transfer_context(  # noqa: B027
-        self, old_indices: np.ndarray, layer_idx: int
+    def set_transfer_context(
+        self,
+        old_indices: np.ndarray,
+        layer_idx: int,
+        perf_context: EplbPerfContext | None = None,
     ) -> None:
         """Pre-set layer context before add_recv calls.
 
-        Default is a no-op; overridden by backends (e.g. NIXL) that need
-        layer-level context to issue transfers inside add_recv.
+        Backends that need layer-level transfer metadata should override this
+        method and call ``super().set_transfer_context``.
         """
+        self._perf_context = perf_context
+
+    def next_rearrangement_id(self) -> int:
+        rearrangement_id = getattr(self, "_next_perf_rearrangement_id", 0)
+        self._next_perf_rearrangement_id = rearrangement_id + 1
+        return rearrangement_id
+
+    def next_generation_id(self) -> int:
+        generation_id = getattr(self, "_next_perf_generation_id", 0)
+        self._next_perf_generation_id = generation_id + 1
+        return generation_id
+
+    def _set_last_backend_perf(self, perf: EplbBackendPerf) -> None:
+        self._last_backend_perf = perf
+
+    def take_last_backend_perf(self) -> EplbBackendPerf:
+        perf = getattr(self, "_last_backend_perf", EplbBackendPerf())
+        self._last_backend_perf = EplbBackendPerf()
+        return perf
+
+    @property
+    def perf_label(self) -> str:
+        return self.__class__.__name__
 
     @property
     def needs_profile_buffer_reservation(self) -> bool:
@@ -343,6 +389,10 @@ class NixlEplbCommunicator(EplbCommunicator):
     def needs_profile_buffer_reservation(self) -> bool:
         return False
 
+    @property
+    def perf_label(self) -> str:
+        return "baseline_nixl"
+
     @staticmethod
     def _init_step(name: str, fn: object, *args: object, **kwargs: object) -> None:
         try:
@@ -370,7 +420,14 @@ class NixlEplbCommunicator(EplbCommunicator):
         # weights are pre-registered and always readable in-place.
         pass
 
-    def set_transfer_context(self, old_indices: np.ndarray, layer_idx: int) -> None:
+    def set_transfer_context(
+        self,
+        old_indices: np.ndarray,
+        layer_idx: int,
+        perf_context: EplbPerfContext | None = None,
+    ) -> None:
+        super().set_transfer_context(old_indices, layer_idx, perf_context)
+        self._read_payloads = []
         self._ensure_remote_state()
         assert not self._xfer_entries, (
             f"set_transfer_context() called with {len(self._xfer_entries)} "
@@ -426,6 +483,12 @@ class NixlEplbCommunicator(EplbCommunicator):
 
         local_h, remote_h, xfer_h = self._create_peer_xfer(
             src_rank, local_descs, remote_descs
+        )
+        read_payloads = getattr(self, "_read_payloads", None)
+        if read_payloads is None:
+            read_payloads = self._read_payloads = []
+        read_payloads.append(
+            (src_rank, expert_id, sum(desc[1] for desc in local_descs))
         )
         self._nixl_wrapper.transfer(xfer_h)
         self._xfer_entries.append((local_h, remote_h, xfer_h))
@@ -574,11 +637,28 @@ class NixlEplbCommunicator(EplbCommunicator):
             "set_transfer_context() must be called before execute() "
             "if any add_recv() calls were made"
         )
+        execute_started = time.perf_counter()
+        wait_started = execute_started
+        wait_seconds = 0.0
+        barrier_seconds = 0.0
         try:
             self._wait_for_all_transfers([x[2] for x in self._xfer_entries])
-
+            wait_seconds = time.perf_counter() - wait_started
+            barrier_started = time.perf_counter()
             self._post_read_barrier()
+            barrier_seconds = time.perf_counter() - barrier_started
         finally:
+            self._set_last_backend_perf(
+                EplbBackendPerf(
+                    fields={
+                        "backend_wall_ms": (time.perf_counter() - execute_started)
+                        * 1000,
+                        "transfer_wait_ms": wait_seconds * 1000,
+                        "barrier_ms": barrier_seconds * 1000,
+                    },
+                    read_payloads=getattr(self, "_read_payloads", []).copy(),
+                )
+            )
             for local_h, remote_h, xfer_h in self._xfer_entries:
                 with contextlib.suppress(Exception):
                     self._nixl_wrapper.release_xfer_handle(xfer_h)
@@ -629,6 +709,10 @@ class PyNcclEplbCommunicator(EplbCommunicator):
             self._pynccl_comm.group_start()
             self._group_started = True
 
+    @property
+    def perf_label(self) -> str:
+        return "pynccl_reference"
+
     def add_send(
         self,
         tensors: list[torch.Tensor],
@@ -651,8 +735,23 @@ class PyNcclEplbCommunicator(EplbCommunicator):
 
     def execute(self) -> None:
         if self._group_started:
-            self._pynccl_comm.group_end()
-            self._group_started = False
+            stream = self._cuda_stream or torch.cuda.current_stream()
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record(stream)
+            submit_started = time.perf_counter()
+            try:
+                self._pynccl_comm.group_end()
+            finally:
+                submit_ms = (time.perf_counter() - submit_started) * 1000
+                end_event.record(stream)
+                self._group_started = False
+                self._set_last_backend_perf(
+                    EplbBackendPerf(
+                        fields={"nccl_group_submit_ms": submit_ms},
+                        gpu_events=(start_event, end_event),
+                    )
+                )
 
 
 def create_eplb_communicator(

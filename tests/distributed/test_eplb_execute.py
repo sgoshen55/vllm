@@ -3,17 +3,21 @@
 
 import random
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed
 
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.eplb.eplb_communicator import (
+    EplbCommunicator,
+    PyNcclEplbCommunicator,
     create_eplb_communicator,
     has_nixl,
 )
 from vllm.distributed.eplb.rebalance_execute import (
     move_from_buffer,
+    move_to_buffer,
     rearrange_expert_weights_inplace,
     transfer_layer,
 )
@@ -23,6 +27,98 @@ from vllm.distributed.parallel_state import (
 )
 
 from .eplb_utils import distributed_run, set_env_vars_and_device
+
+
+class _RecordingEplbCommunicator(EplbCommunicator):
+    def __init__(self) -> None:
+        self.sends: list[tuple[int, int]] = []
+        self.recvs: list[tuple[int, int]] = []
+
+    def add_send(
+        self,
+        tensors: list[torch.Tensor],
+        dst_rank: int,
+        expert_id: int,
+    ) -> None:
+        self.sends.append((dst_rank, expert_id))
+
+    def add_recv(
+        self,
+        tensors: list[torch.Tensor],
+        src_rank: int,
+        expert_id: int,
+    ) -> None:
+        self.recvs.append((src_rank, expert_id))
+
+    def execute(self) -> None:
+        pass
+
+
+def test_eplb_perf_ids_are_monotonic() -> None:
+    communicator = _RecordingEplbCommunicator()
+
+    assert [communicator.next_rearrangement_id() for _ in range(3)] == [0, 1, 2]
+    assert [communicator.next_generation_id() for _ in range(3)] == [0, 1, 2]
+
+
+def test_move_to_buffer_counts_remote_payload_bytes() -> None:
+    communicator = _RecordingEplbCommunicator()
+    expert_weights = [torch.zeros((1, 4), dtype=torch.float32)]
+    expert_buffers = [torch.zeros_like(expert_weights[0])]
+
+    metadata = move_to_buffer(
+        num_local_experts=1,
+        old_indices=np.array([0, 1]),
+        new_indices=np.array([1, 0]),
+        expert_weights=expert_weights,
+        expert_weights_buffers=expert_buffers,
+        cuda_stream=None,
+        ep_rank=0,
+        communicator=communicator,
+    )
+
+    assert metadata.tx_bytes == 16
+    assert metadata.rx_bytes == 16
+    assert metadata.send_transfers == 1
+    assert metadata.recv_transfers == 1
+    assert communicator.sends == [(1, 0)]
+    assert communicator.recvs == [(1, 1)]
+
+
+def test_pynccl_execute_records_gpu_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded_streams: list[object] = []
+
+    class FakeEvent:
+        def __init__(self, enable_timing: bool) -> None:
+            assert enable_timing
+
+        def record(self, stream: object) -> None:
+            recorded_streams.append(stream)
+
+    class FakePyNccl:
+        def __init__(self) -> None:
+            self.group_end_calls = 0
+
+        def group_end(self) -> None:
+            self.group_end_calls += 1
+
+    monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
+    stream = object()
+    pynccl = FakePyNccl()
+    communicator = object.__new__(PyNcclEplbCommunicator)
+    communicator._pynccl_comm = pynccl
+    communicator._cuda_stream = stream
+    communicator._group_started = True
+
+    communicator.execute()
+
+    perf = communicator.take_last_backend_perf()
+    assert pynccl.group_end_calls == 1
+    assert recorded_streams == [stream, stream]
+    assert perf.gpu_events is not None
+    assert perf.fields["nccl_group_submit_ms"] >= 0
 
 
 def create_expert_indices_with_redundancy(
