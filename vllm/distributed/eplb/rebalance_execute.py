@@ -13,7 +13,11 @@ import numpy as np
 import torch
 from torch.distributed import ProcessGroup, all_gather
 
-from vllm.distributed.eplb.eplb_communicator import EplbCommunicator
+from vllm.distributed.eplb.eplb_communicator import (
+    EplbBackendPerf,
+    EplbCommunicator,
+    EplbPerfContext,
+)
 from vllm.distributed.eplb.eplb_utils import CpuGpuEvent
 from vllm.logger import init_logger
 
@@ -36,6 +40,16 @@ class TransferMetadata:
     """Expert ids (num_local_experts,) of remote primary experts."""
     recv_dst_rows: np.ndarray
     """Target expert indices (num_local_experts,) in local tensors to send."""
+    tx_bytes: int
+    """Remote payload bytes sent by this rank for the layer transfer."""
+    rx_bytes: int
+    """Remote payload bytes received by this rank for the layer transfer."""
+    send_transfers: int
+    """Number of logical remote expert sends issued by this rank."""
+    recv_transfers: int
+    """Number of logical remote expert receives issued by this rank."""
+    backend_perf: EplbBackendPerf
+    """Backend-specific timing fields for this layer transfer."""
 
 
 @dataclass
@@ -60,6 +74,67 @@ class AsyncEplbLayerResult:
     thread calls record() after it finishes transferring weights out of the intermediate
     buffer in _move_to_workspace()
     """
+
+
+@dataclass(slots=True)
+class _EplbLayerPerfRecord:
+    context: EplbPerfContext
+    transfer: TransferMetadata
+    generation_events: tuple[torch.cuda.Event, torch.cuda.Event]
+    staging_events: tuple[torch.cuda.Event, torch.cuda.Event]
+
+
+def _format_perf_value(value: int | float | str) -> str:
+    if isinstance(value, float):
+        return f"{value:.3f}"
+    return str(value)
+
+
+def _log_layer_perf(
+    communicator: EplbCommunicator,
+    record: _EplbLayerPerfRecord,
+) -> None:
+    generation_start, generation_end = record.generation_events
+    staging_start, staging_end = record.staging_events
+    fields: dict[str, int | float | str] = {
+        "communicator": communicator.perf_label,
+        "rearrangement_id": record.context.rearrangement_id,
+        "generation_id": record.context.generation_id,
+        "layer_id": record.context.layer_id,
+        "rank": record.context.rank,
+        "generation_wall_ms": generation_start.elapsed_time(generation_end),
+        "staging_ms": staging_start.elapsed_time(staging_end),
+        "tx_bytes": record.transfer.tx_bytes,
+        "rx_bytes": record.transfer.rx_bytes,
+        "io_bytes": record.transfer.tx_bytes + record.transfer.rx_bytes,
+        "send_transfers": record.transfer.send_transfers,
+        "recv_transfers": record.transfer.recv_transfers,
+    }
+    fields.update(record.transfer.backend_perf.fields)
+    if record.transfer.backend_perf.gpu_events is not None:
+        backend_start, backend_end = record.transfer.backend_perf.gpu_events
+        fields["nccl_group_gpu_ms"] = backend_start.elapsed_time(backend_end)
+    logger.info(
+        "EPLB_PERF %s",
+        " ".join(f"{key}={_format_perf_value(value)}" for key, value in fields.items()),
+    )
+    for (
+        source_rank,
+        expert_id,
+        payload_bytes,
+    ) in record.transfer.backend_perf.read_payloads:
+        logger.info(
+            "EPLB_READ communicator=%s rearrangement_id=%d generation_id=%d "
+            "layer_id=%d rank=%d source_rank=%d expert_id=%d payload_bytes=%d",
+            communicator.perf_label,
+            record.context.rearrangement_id,
+            record.context.generation_id,
+            record.context.layer_id,
+            record.context.rank,
+            source_rank,
+            expert_id,
+            payload_bytes,
+        )
 
 
 def get_ep_ranks_with_experts_batch(
@@ -179,6 +254,7 @@ def move_to_buffer(
     ep_rank: int,
     communicator: EplbCommunicator,
     layer_idx: int = 0,
+    perf_context: EplbPerfContext | None = None,
 ) -> TransferMetadata:
     """
     Rearranges expert weights during EPLB rebalancing.
@@ -267,7 +343,11 @@ def move_to_buffer(
                     for w, b in zip(expert_weights, expert_weights_buffers):
                         b[dst].copy_(w[src_local], non_blocking=True)
 
-    communicator.set_transfer_context(old_indices, layer_idx)
+    communicator.set_transfer_context(old_indices, layer_idx, perf_context)
+    tx_bytes = 0
+    rx_bytes = 0
+    send_transfers = 0
+    recv_transfers = 0
 
     # 2. Post sends
     if send_count > 0:
@@ -300,6 +380,8 @@ def move_to_buffer(
                 recv_ranks.append(ranks_to_recv[recver_pos])
             expert_tensors = [w[src] for w in expert_weights]
             for dst in recv_ranks:
+                tx_bytes += sum(tensor.nbytes for tensor in expert_tensors)
+                send_transfers += 1
                 communicator.add_send(expert_tensors, dst, expert_id=int(expert))
 
     # 3. Post recvs
@@ -329,14 +411,18 @@ def move_to_buffer(
                 src = ranks_to_send[recver_pos // num_dst_per_sender]
             else:
                 src = ranks_to_send[recver_pos - remainder_start]
+            recv_tensors = [b[dst] for b in expert_weights_buffers]
+            rx_bytes += sum(tensor.nbytes for tensor in recv_tensors)
+            recv_transfers += 1
             communicator.add_recv(
-                [b[dst] for b in expert_weights_buffers],
+                recv_tensors,
                 src,
                 expert_id=int(expert),
             )
 
     # 4. Execute transfers and wait for completion.
     communicator.execute()
+    backend_perf = communicator.take_last_backend_perf()
     return TransferMetadata(
         is_unchanged=is_unchanged,
         is_received_locally=is_received_locally,
@@ -344,6 +430,11 @@ def move_to_buffer(
         recv_count=recv_count,
         recv_expert_ids=recv_expert_ids,
         recv_dst_rows=recv_dst_rows,
+        tx_bytes=tx_bytes,
+        rx_bytes=rx_bytes,
+        send_transfers=send_transfers,
+        recv_transfers=recv_transfers,
+        backend_perf=backend_perf,
     )
 
 
@@ -593,7 +684,20 @@ def rearrange_expert_weights_inplace(
     old_global_expert_indices_cpu = old_global_expert_indices.cpu().numpy()
     new_global_expert_indices_cpu = new_global_expert_indices.cpu().numpy()
 
+    rearrangement_id = communicator.next_rearrangement_id()
+    perf_records: list[_EplbLayerPerfRecord] = []
     for layer_idx in range(num_moe_layers):
+        context = EplbPerfContext(
+            rearrangement_id=rearrangement_id,
+            generation_id=communicator.next_generation_id(),
+            layer_id=layer_idx,
+            rank=ep_rank,
+        )
+        generation_start = torch.cuda.Event(enable_timing=True)
+        generation_end = torch.cuda.Event(enable_timing=True)
+        staging_start = torch.cuda.Event(enable_timing=True)
+        staging_end = torch.cuda.Event(enable_timing=True)
+        generation_start.record()
         transfer_metadata = move_to_buffer(
             num_local_experts=num_local_physical_experts,
             old_indices=old_global_expert_indices_cpu[layer_idx],
@@ -604,8 +708,10 @@ def rearrange_expert_weights_inplace(
             ep_rank=ep_rank,
             communicator=communicator,
             layer_idx=layer_idx,
+            perf_context=context,
         )
 
+        staging_start.record()
         move_from_buffer(
             expert_weights=expert_weights[layer_idx],
             expert_weights_buffers=weights_buffer,
@@ -613,6 +719,21 @@ def rearrange_expert_weights_inplace(
             new_indices=new_global_expert_indices_cpu[layer_idx],
             ep_rank=ep_rank,
         )
+        staging_end.record()
+        generation_end.record()
+        perf_records.append(
+            _EplbLayerPerfRecord(
+                context=context,
+                transfer=transfer_metadata,
+                generation_events=(generation_start, generation_end),
+                staging_events=(staging_start, staging_end),
+            )
+        )
+
+    if perf_records:
+        perf_records[-1].generation_events[1].synchronize()
+        for record in perf_records:
+            _log_layer_perf(communicator, record)
 
 
 def _map_old_expert_indices_with_rank_mapping(

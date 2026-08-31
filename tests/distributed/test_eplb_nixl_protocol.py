@@ -16,10 +16,12 @@ from vllm.distributed.eplb.eplb_communicator import (
     _NixlEplbAbortNotification,
     _NixlEplbAbortReason,
     _NixlEplbDeadlinePhase,
+    _NixlEplbExclusivePhaseTimer,
     _NixlEplbNotification,
     _NixlEplbNotificationDisposition,
     _NixlEplbNotificationKind,
     _NixlEplbPeerAbortError,
+    _NixlEplbPerfPhase,
     _NixlEplbProtocolState,
     _NixlEplbTransferKey,
     create_eplb_communicator,
@@ -35,6 +37,37 @@ class FakeClock:
 
     def advance(self, seconds: float) -> None:
         self.now += seconds
+
+
+def test_exclusive_phase_timer_partitions_elapsed_time() -> None:
+    clock = FakeClock()
+    timer = _NixlEplbExclusivePhaseTimer(clock)
+
+    clock.advance(1.0)
+    timer.transition(_NixlEplbPerfPhase.READY_WAIT)
+    clock.advance(2.0)
+    timer.transition(_NixlEplbPerfPhase.READ_EXECUTION)
+    clock.advance(3.0)
+    timer.transition(_NixlEplbPerfPhase.READ_DONE_WAIT)
+    clock.advance(4.0)
+    timer.transition(_NixlEplbPerfPhase.PROTOCOL_RESIDUAL)
+    clock.advance(5.0)
+    totals = timer.finish()
+
+    assert totals[_NixlEplbPerfPhase.READY_WAIT] == 2.0
+    assert totals[_NixlEplbPerfPhase.READ_EXECUTION] == 3.0
+    assert totals[_NixlEplbPerfPhase.READ_DONE_WAIT] == 4.0
+    assert totals[_NixlEplbPerfPhase.PROTOCOL_RESIDUAL] == 6.0
+    assert sum(totals.values()) == 15.0
+
+
+def test_candidate_perf_generation_uses_protocol_generation() -> None:
+    communicator = object.__new__(NixlEplbCommunicator)
+    communicator._sync_protocol_active = True
+    communicator._next_sync_generation = 7
+
+    assert communicator.next_generation_id() == 7
+    assert communicator._next_sync_generation == 7
 
 
 class FakeNixlAgent:
@@ -823,7 +856,7 @@ def test_future_abort_is_deferred_until_its_generation() -> None:
     assert agent.sent_notifications == []
 
 
-def test_non_sync_execute_keeps_legacy_path_uninstrumented(
+def test_non_sync_execute_records_baseline_backend_timings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     communicator = object.__new__(NixlEplbCommunicator)
@@ -852,16 +885,12 @@ def test_non_sync_execute_keeps_legacy_path_uninstrumented(
         "_post_read_barrier",
         lambda: events.append(("barrier", None)),
     )
-    monkeypatch.setattr(
-        eplb_communicator.time,
-        "perf_counter",
-        lambda: pytest.fail("non-sync path must not record protocol timings"),
-    )
-
     communicator.execute()
 
     assert events == [("wait", []), ("barrier", None)]
     assert communicator._last_execute_stats is None
+    fields = communicator.take_last_backend_perf().fields
+    assert set(fields) == {"backend_wall_ms", "transfer_wait_ms", "barrier_ms"}
 
 
 def test_non_sync_add_recv_keeps_legacy_transfer_path(

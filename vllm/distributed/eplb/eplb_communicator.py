@@ -10,7 +10,7 @@ import time
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import Enum, IntEnum
 
@@ -47,6 +47,25 @@ _NIXL_EPLB_ABORT_NOTIFICATION_STRUCT = struct.Struct("!4sBBQIIII")
 _NIXL_EPLB_DEFAULT_TIMEOUT_SECONDS = 300.0
 
 
+@dataclass(frozen=True, slots=True)
+class EplbPerfContext:
+    """Stable identifiers for one rank-local EPLB layer transfer."""
+
+    rearrangement_id: int
+    generation_id: int
+    layer_id: int
+    rank: int
+
+
+@dataclass(slots=True)
+class EplbBackendPerf:
+    """Backend timing fields captured by one communicator execution."""
+
+    fields: dict[str, int | float | str] = field(default_factory=dict)
+    gpu_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
+    read_payloads: list[tuple[int, int, int]] = field(default_factory=list)
+
+
 def _normalize_nixl_agent_name(agent_name: str | bytes) -> str:
     if isinstance(agent_name, bytes):
         return agent_name.decode()
@@ -78,6 +97,36 @@ class _NixlEplbDeadlinePhase(Enum):
     READY = "missing READY"
     READ = "local READ completion"
     READ_DONE = "missing READ_DONE"
+
+
+class _NixlEplbPerfPhase(Enum):
+    READY_WAIT = "ready_wait_ms"
+    READ_EXECUTION = "read_execution_ms"
+    READ_DONE_WAIT = "read_done_wait_ms"
+    PROTOCOL_RESIDUAL = "protocol_residual_ms"
+
+
+class _NixlEplbExclusivePhaseTimer:
+    """Accumulate mutually exclusive protocol-state occupancy."""
+
+    def __init__(
+        self,
+        clock: Callable[[], float] = time.perf_counter,
+    ) -> None:
+        self._clock = clock
+        self._phase = _NixlEplbPerfPhase.PROTOCOL_RESIDUAL
+        self._last_transition = clock()
+        self._totals = dict.fromkeys(_NixlEplbPerfPhase, 0.0)
+
+    def transition(self, phase: _NixlEplbPerfPhase) -> None:
+        now = self._clock()
+        self._totals[self._phase] += now - self._last_transition
+        self._phase = phase
+        self._last_transition = now
+
+    def finish(self) -> dict[_NixlEplbPerfPhase, float]:
+        self.transition(self._phase)
+        return dict(self._totals)
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,6 +409,10 @@ class _NixlEplbExecuteStats:
     abort_sent: int = 0
     abort_received: int = 0
     abort_send_failures: int = 0
+    exclusive_ready_wait_seconds: float = 0.0
+    exclusive_read_execution_seconds: float = 0.0
+    exclusive_read_done_wait_seconds: float = 0.0
+    exclusive_protocol_residual_seconds: float = 0.0
 
 
 @dataclass(slots=True)
@@ -640,14 +693,40 @@ class EplbCommunicator(ABC):
         On return, all data is available in the destination buffers.
         """
 
-    def set_transfer_context(  # noqa: B027
-        self, old_indices: np.ndarray, layer_idx: int
+    def set_transfer_context(
+        self,
+        old_indices: np.ndarray,
+        layer_idx: int,
+        perf_context: EplbPerfContext | None = None,
     ) -> None:
         """Pre-set layer context before add_recv calls.
 
-        Default is a no-op; overridden by backends (e.g. NIXL) that need
-        layer-level context to issue transfers inside add_recv.
+        Backends that need layer-level transfer metadata should override this
+        method and call ``super().set_transfer_context``.
         """
+        self._perf_context = perf_context
+
+    def next_rearrangement_id(self) -> int:
+        rearrangement_id = getattr(self, "_next_perf_rearrangement_id", 0)
+        self._next_perf_rearrangement_id = rearrangement_id + 1
+        return rearrangement_id
+
+    def next_generation_id(self) -> int:
+        generation_id = getattr(self, "_next_perf_generation_id", 0)
+        self._next_perf_generation_id = generation_id + 1
+        return generation_id
+
+    def _set_last_backend_perf(self, perf: EplbBackendPerf) -> None:
+        self._last_backend_perf = perf
+
+    def take_last_backend_perf(self) -> EplbBackendPerf:
+        perf = getattr(self, "_last_backend_perf", EplbBackendPerf())
+        self._last_backend_perf = EplbBackendPerf()
+        return perf
+
+    @property
+    def perf_label(self) -> str:
+        return self.__class__.__name__
 
     @property
     def needs_profile_buffer_reservation(self) -> bool:
@@ -904,6 +983,7 @@ class NixlEplbCommunicator(EplbCommunicator):
         ] = {}
         self._protocol_failed = False
         self._protocol_failure: str | None = None
+        self._exclusive_phase_timer: _NixlEplbExclusivePhaseTimer | None = None
 
         self._cuda_device_id = int(self._device.index or 0)
         self._remote_state_initialized = False
@@ -933,6 +1013,15 @@ class NixlEplbCommunicator(EplbCommunicator):
     @property
     def needs_profile_buffer_reservation(self) -> bool:
         return False
+
+    @property
+    def perf_label(self) -> str:
+        return "candidate_nixl" if self._sync_protocol_active else "baseline_nixl"
+
+    def next_generation_id(self) -> int:
+        if self._sync_protocol_active:
+            return self._next_sync_generation
+        return super().next_generation_id()
 
     @staticmethod
     def _init_step(name: str, fn: object, *args: object, **kwargs: object) -> None:
@@ -1072,7 +1161,13 @@ class NixlEplbCommunicator(EplbCommunicator):
             self._fail_sync_protocol(exc, broadcast=True)
             raise
 
-    def set_transfer_context(self, old_indices: np.ndarray, layer_idx: int) -> None:
+    def set_transfer_context(
+        self,
+        old_indices: np.ndarray,
+        layer_idx: int,
+        perf_context: EplbPerfContext | None = None,
+    ) -> None:
+        super().set_transfer_context(old_indices, layer_idx, perf_context)
         if self._sync_protocol_active:
             self._raise_if_sync_protocol_failed()
         self._ensure_remote_state()
@@ -1085,6 +1180,7 @@ class NixlEplbCommunicator(EplbCommunicator):
             f"from layer {self._layer_idx}; execute() was not called after the "
             "previous transfer setup"
         )
+        self._read_payloads = []
         self._layer_idx = layer_idx
         n = self._num_local_experts
         rank_experts = old_indices[: self._world_size * n].reshape(self._world_size, n)
@@ -1095,8 +1191,14 @@ class NixlEplbCommunicator(EplbCommunicator):
         if self._sync_protocol_active:
             generation = self._next_sync_generation
             self._next_sync_generation += 1
+            if perf_context is not None:
+                assert generation == perf_context.generation_id, (
+                    "NIXL protocol and performance generation IDs diverged: "
+                    f"protocol={generation}, perf={perf_context.generation_id}"
+                )
             self._sync_protocol_state.begin_generation(generation)
             self._sync_stats = _NixlEplbExecuteStats(sync_protocol_active=True)
+            self._exclusive_phase_timer = _NixlEplbExclusivePhaseTimer()
             self._source_expectations_frozen = False
 
     def add_recv(
@@ -1141,6 +1243,7 @@ class NixlEplbCommunicator(EplbCommunicator):
                 _NixlEplbDeadlinePhase.READY,
                 key,
             )
+            self._update_exclusive_phase()
         except _NixlEplbPeerAbortError as exc:
             self._fail_sync_protocol(exc, broadcast=False)
             raise
@@ -1214,6 +1317,7 @@ class NixlEplbCommunicator(EplbCommunicator):
             src_rank,
             expert_id,
         )
+        self._record_read_payload(src_rank, expert_id, local_descs)
         local_h, remote_h, xfer_h = self._create_peer_xfer(
             src_rank, local_descs, remote_descs
         )
@@ -1307,6 +1411,7 @@ class NixlEplbCommunicator(EplbCommunicator):
                     key,
                 )
         self._source_expectations_frozen = True
+        self._update_exclusive_phase()
 
     def _progress_notifications_once(self) -> bool:
         assert self._source_expectations_frozen
@@ -1391,6 +1496,7 @@ class NixlEplbCommunicator(EplbCommunicator):
             )
         if notification.kind == _NixlEplbNotificationKind.READY:
             self._sync_stats.ready_received += 1
+            self._update_exclusive_phase()
             return
 
         self._sync_stats.read_done_received += 1
@@ -1408,6 +1514,7 @@ class NixlEplbCommunicator(EplbCommunicator):
                 _NixlEplbDeadlinePhase.READ_DONE,
                 source_key,
             )
+        self._update_exclusive_phase()
 
     def _post_ready_reads(self) -> bool:
         made_progress = False
@@ -1422,6 +1529,7 @@ class NixlEplbCommunicator(EplbCommunicator):
             self._record_ready_wait(request)
             self._post_sync_read(request)
             made_progress = True
+        self._update_exclusive_phase()
         return made_progress
 
     def _record_ready_wait(self, request: _NixlEplbPendingRead) -> None:
@@ -1444,6 +1552,11 @@ class NixlEplbCommunicator(EplbCommunicator):
                 request.tensors,
                 request.key.source,
                 request.key.expert,
+            )
+            self._record_read_payload(
+                request.key.source,
+                request.key.expert,
+                local_descs,
             )
             read_done = _NixlEplbNotification(
                 _NixlEplbNotificationKind.READ_DONE,
@@ -1475,6 +1588,7 @@ class NixlEplbCommunicator(EplbCommunicator):
             )
             self._sync_stats.reads_posted += 1
             self._sync_stats.read_done_attached += 1
+            self._update_exclusive_phase()
         except Exception as exc:
             self._mark_abort_reason(exc, _NixlEplbAbortReason.READ_FAILURE)
             if xfer_h is not None:
@@ -1489,6 +1603,19 @@ class NixlEplbCommunicator(EplbCommunicator):
             raise
         finally:
             self._sync_stats.read_post_seconds += time.perf_counter() - post_started
+
+    def _record_read_payload(
+        self,
+        src_rank: int,
+        expert_id: int,
+        local_descs: list[tuple[int, int, int]],
+    ) -> None:
+        read_payloads = getattr(self, "_read_payloads", None)
+        if read_payloads is None:
+            read_payloads = self._read_payloads = []
+        read_payloads.append(
+            (src_rank, expert_id, sum(desc[1] for desc in local_descs))
+        )
 
     def _progress_active_reads(self) -> bool:
         assert self._sync_stats is not None
@@ -1530,7 +1657,45 @@ class NixlEplbCommunicator(EplbCommunicator):
             self._release_active_read(entry)
             del self._active_reads[key]
             made_progress = True
+        self._update_exclusive_phase()
         return made_progress
+
+    def _current_exclusive_phase(self) -> _NixlEplbPerfPhase:
+        if self._active_reads:
+            return _NixlEplbPerfPhase.READ_EXECUTION
+        if self._pending_reads:
+            return _NixlEplbPerfPhase.READY_WAIT
+        if self._source_expectations_frozen and any(
+            not self._sync_protocol_state.source_complete(key)
+            for key in self._source_readers
+        ):
+            return _NixlEplbPerfPhase.READ_DONE_WAIT
+        return _NixlEplbPerfPhase.PROTOCOL_RESIDUAL
+
+    def _update_exclusive_phase(self) -> None:
+        timer = getattr(self, "_exclusive_phase_timer", None)
+        if timer is not None:
+            timer.transition(self._current_exclusive_phase())
+
+    def _finish_exclusive_phase_timing(
+        self,
+        stats: _NixlEplbExecuteStats,
+    ) -> None:
+        timer = getattr(self, "_exclusive_phase_timer", None)
+        if timer is None:
+            return
+        totals = timer.finish()
+        stats.exclusive_ready_wait_seconds = totals[_NixlEplbPerfPhase.READY_WAIT]
+        stats.exclusive_read_execution_seconds = totals[
+            _NixlEplbPerfPhase.READ_EXECUTION
+        ]
+        stats.exclusive_read_done_wait_seconds = totals[
+            _NixlEplbPerfPhase.READ_DONE_WAIT
+        ]
+        stats.exclusive_protocol_residual_seconds = totals[
+            _NixlEplbPerfPhase.PROTOCOL_RESIDUAL
+        ]
+        self._exclusive_phase_timer = None
 
     def _release_active_read(self, entry: _NixlEplbActiveRead) -> None:
         with contextlib.suppress(Exception):
@@ -1687,10 +1852,28 @@ class NixlEplbCommunicator(EplbCommunicator):
             "if any transfers were added"
         )
         if not self._sync_protocol_active:
+            execute_started = time.perf_counter()
+            wait_seconds = 0.0
+            barrier_seconds = 0.0
             try:
+                wait_started = time.perf_counter()
                 self._wait_for_all_transfers([x[2] for x in self._xfer_entries])
+                wait_seconds = time.perf_counter() - wait_started
+                barrier_started = time.perf_counter()
                 self._post_read_barrier()
+                barrier_seconds = time.perf_counter() - barrier_started
             finally:
+                self._set_last_backend_perf(
+                    EplbBackendPerf(
+                        fields={
+                            "backend_wall_ms": (time.perf_counter() - execute_started)
+                            * 1000,
+                            "transfer_wait_ms": wait_seconds * 1000,
+                            "barrier_ms": barrier_seconds * 1000,
+                        },
+                        read_payloads=getattr(self, "_read_payloads", []).copy(),
+                    )
+                )
                 self._clear_transfer_state()
             return
 
@@ -1725,7 +1908,33 @@ class NixlEplbCommunicator(EplbCommunicator):
             raise
         finally:
             stats.execute_seconds = time.perf_counter() - execute_started
+            self._finish_exclusive_phase_timing(stats)
             self._last_execute_stats = stats
+            self._set_last_backend_perf(
+                EplbBackendPerf(
+                    fields={
+                        "backend_wall_ms": stats.execute_seconds * 1000,
+                        "ready_wait_sum_ms": (stats.ready_wait_sum_seconds * 1000),
+                        "read_completion_sum_ms": (
+                            stats.read_completion_sum_seconds * 1000
+                        ),
+                        "read_done_wait_sum_ms": (
+                            stats.read_done_wait_sum_seconds * 1000
+                        ),
+                        "ready_wait_ms": (stats.exclusive_ready_wait_seconds * 1000),
+                        "read_execution_ms": (
+                            stats.exclusive_read_execution_seconds * 1000
+                        ),
+                        "read_done_wait_ms": (
+                            stats.exclusive_read_done_wait_seconds * 1000
+                        ),
+                        "protocol_residual_ms": (
+                            stats.exclusive_protocol_residual_seconds * 1000
+                        ),
+                    },
+                    read_payloads=getattr(self, "_read_payloads", []).copy(),
+                )
+            )
             logger.debug(
                 "NIXL EPLB execute stats: rank=%d generation=%d "
                 "sync_protocol=%s reads=%d execute_ms=%.3f "
@@ -1805,6 +2014,10 @@ class PyNcclEplbCommunicator(EplbCommunicator):
             self._pynccl_comm.group_start()
             self._group_started = True
 
+    @property
+    def perf_label(self) -> str:
+        return "pynccl_reference"
+
     def add_send(
         self,
         tensors: list[torch.Tensor],
@@ -1827,8 +2040,23 @@ class PyNcclEplbCommunicator(EplbCommunicator):
 
     def execute(self) -> None:
         if self._group_started:
-            self._pynccl_comm.group_end()
-            self._group_started = False
+            stream = self._cuda_stream or torch.cuda.current_stream()
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record(stream)
+            submit_started = time.perf_counter()
+            try:
+                self._pynccl_comm.group_end()
+            finally:
+                submit_ms = (time.perf_counter() - submit_started) * 1000
+                end_event.record(stream)
+                self._group_started = False
+                self._set_last_backend_perf(
+                    EplbBackendPerf(
+                        fields={"nccl_group_submit_ms": submit_ms},
+                        gpu_events=(start_event, end_event),
+                    )
+                )
 
 
 def create_eplb_communicator(
