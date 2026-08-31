@@ -241,8 +241,10 @@ class GenerationSummary:
     read_execution_ms: float | None = None
     read_done_wait_ms: float | None = None
     protocol_residual_ms: float | None = None
-    residual_ms: float | None = None
-    residual_pct: float | None = None
+    decomposition_residual_ms: float | None = None
+    decomposition_residual_pct: float | None = None
+    unaccounted_residual_ms: float | None = None
+    unaccounted_residual_pct: float | None = None
     residual_flag: str = ""
 
 
@@ -272,6 +274,7 @@ class AnalysisConfig:
     expected_ranks: int = 8
     min_rearrangements: int = 64
     expected_phases: int = 64
+    steady_state_start_rearrangement: int = 10
     residual_threshold_pct: float = 10.0
     negative_residual_tolerance_ms: float = 0.1
 
@@ -696,30 +699,43 @@ def summarize_generations(
             "read_execution_ms": None,
             "read_done_wait_ms": None,
             "protocol_residual_ms": None,
-            "residual_ms": None,
-            "residual_pct": None,
+            "decomposition_residual_ms": None,
+            "decomposition_residual_pct": None,
+            "unaccounted_residual_ms": None,
+            "unaccounted_residual_pct": None,
             "residual_flag": "",
         }
         if communicator == "candidate_nixl":
             ready_wait = critical.number("ready_wait_ms")
             read_execution = critical.number("read_execution_ms")
             read_done_wait = critical.number("read_done_wait_ms")
+            protocol_residual = critical.number("protocol_residual_ms")
             staging = critical.number("staging_ms")
             wall = critical.number("generation_wall_ms")
-            residual = wall - ready_wait - read_execution - read_done_wait - staging
-            residual_pct = 100 * residual / wall if wall else math.nan
+            decomposition_residual = (
+                wall - ready_wait - read_execution - read_done_wait - staging
+            )
+            decomposition_residual_pct = (
+                100 * decomposition_residual / wall if wall else math.nan
+            )
+            unaccounted_residual = decomposition_residual - protocol_residual
+            unaccounted_residual_pct = (
+                100 * unaccounted_residual / wall if wall else math.nan
+            )
             flags = []
-            if residual_pct > residual_threshold_pct:
+            if unaccounted_residual_pct > residual_threshold_pct:
                 flags.append("HIGH_RESIDUAL")
-            if residual < -negative_residual_tolerance_ms:
+            if unaccounted_residual < -negative_residual_tolerance_ms:
                 flags.append("NEGATIVE_RESIDUAL")
             candidate_values = {
                 "ready_wait_ms": ready_wait,
                 "read_execution_ms": read_execution,
                 "read_done_wait_ms": read_done_wait,
-                "protocol_residual_ms": critical.number("protocol_residual_ms"),
-                "residual_ms": residual,
-                "residual_pct": residual_pct,
+                "protocol_residual_ms": protocol_residual,
+                "decomposition_residual_ms": decomposition_residual,
+                "decomposition_residual_pct": decomposition_residual_pct,
+                "unaccounted_residual_ms": unaccounted_residual,
+                "unaccounted_residual_pct": unaccounted_residual_pct,
                 "residual_flag": ";".join(flags),
             }
 
@@ -814,21 +830,53 @@ def _generation_rows(summaries: Sequence[GenerationSummary]) -> list[dict[str, o
 
 def _candidate_phase_rows(
     summaries: Sequence[GenerationSummary],
+    steady_state_start: int,
 ) -> list[dict[str, object]]:
     candidate = [s for s in summaries if s.communicator == "candidate_nixl"]
-    phases = {
-        "ready_wait_ms": [s.ready_wait_ms for s in candidate],
-        "read_execution_ms": [s.read_execution_ms for s in candidate],
-        "read_done_wait_ms": [s.read_done_wait_ms for s in candidate],
-        "protocol_residual_ms": [s.protocol_residual_ms for s in candidate],
-        "staging_ms": [s.staging_ms for s in candidate],
-        "residual_ms": [s.residual_ms for s in candidate],
-        "residual_pct": [s.residual_pct for s in candidate],
-    }
     rows = []
-    for phase, values in phases.items():
-        numeric = [float(value) for value in values if value is not None]
-        rows.append({"phase": phase, **_stats(numeric)})
+    scopes = [
+        (
+            "steady_state",
+            [s for s in candidate if s.rearrangement_id >= steady_state_start],
+            steady_state_start,
+        ),
+        ("all", candidate, 0),
+    ]
+    if steady_state_start:
+        scopes.insert(
+            1,
+            (
+                "initialization",
+                [s for s in candidate if s.rearrangement_id < steady_state_start],
+                0,
+            ),
+        )
+    for scope, selected, start in scopes:
+        phases = {
+            "ready_wait_ms": [s.ready_wait_ms for s in selected],
+            "read_execution_ms": [s.read_execution_ms for s in selected],
+            "read_done_wait_ms": [s.read_done_wait_ms for s in selected],
+            "protocol_residual_ms": [s.protocol_residual_ms for s in selected],
+            "staging_ms": [s.staging_ms for s in selected],
+            "decomposition_residual_ms": [
+                s.decomposition_residual_ms for s in selected
+            ],
+            "decomposition_residual_pct": [
+                s.decomposition_residual_pct for s in selected
+            ],
+            "unaccounted_residual_ms": [s.unaccounted_residual_ms for s in selected],
+            "unaccounted_residual_pct": [s.unaccounted_residual_pct for s in selected],
+        }
+        for phase, values in phases.items():
+            numeric = [float(value) for value in values if value is not None]
+            rows.append(
+                {
+                    "scope": scope,
+                    "start_rearrangement_id": start,
+                    "phase": phase,
+                    **_stats(numeric),
+                }
+            )
     return rows
 
 
@@ -836,78 +884,107 @@ def _comparison_rows(
     logs: Sequence[ParsedLog],
     summaries: Sequence[GenerationSummary],
     clients: Sequence[ParsedClientLog],
+    steady_state_start: int,
 ) -> list[dict[str, object]]:
     rows = []
     clients_by_label = {client.label: client for client in clients}
-    for parsed in logs:
-        communicator = parsed.expected_communicator
-        selected = [s for s in summaries if s.communicator == communicator]
-        outer = _stats(parsed.rearrangement_ms)
-        wall = _stats([s.generation_wall_ms for s in selected])
-        inner = _stats([s.inner_time_ms for s in selected])
-        payload = _stats([float(s.unique_payload_bytes) for s in selected])
-        cov = _stats([s.rank_cov for s in selected])
-        client = clients_by_label.get(parsed.label)
-        phase_elapsed = _stats(
-            [record.number("phase_elapsed_s") * 1000 for record in client.phases]
-            if client
-            else []
-        )
-        request_count = (
-            sum(record.integer("requests") for record in client.phases) if client else 0
-        )
-        weighted_request_mean = (
-            sum(
-                record.number("request_latency_mean_ms") * record.integer("requests")
-                for record in client.phases
+    scopes = [
+        ("steady_state", steady_state_start, None),
+        ("all", 0, None),
+    ]
+    if steady_state_start:
+        scopes.insert(1, ("initialization", 0, steady_state_start))
+    for scope, start, stop in scopes:
+        for parsed in logs:
+            communicator = parsed.expected_communicator
+            selected = [
+                s
+                for s in summaries
+                if s.communicator == communicator
+                and s.rearrangement_id >= start
+                and (stop is None or s.rearrangement_id < stop)
+            ]
+            outer = _stats(parsed.rearrangement_ms[start:stop])
+            wall = _stats([s.generation_wall_ms for s in selected])
+            inner = _stats([s.inner_time_ms for s in selected])
+            payload = _stats([float(s.unique_payload_bytes) for s in selected])
+            total_io = _stats(
+                [float(s.tx_bytes_total + s.rx_bytes_total) for s in selected]
             )
-            / request_count
-            if client and request_count
-            else math.nan
-        )
-        phase_p95 = _stats(
-            [record.number("request_latency_p95_ms") for record in client.phases]
-            if client
-            else []
-        )
-        rows.append(
-            {
-                "communicator": communicator,
-                "rearrangement_count": outer["count"],
-                "rearrangement_wall_mean_ms": outer["mean"],
-                "rearrangement_wall_median_ms": outer["median"],
-                "rearrangement_wall_p95_ms": outer["p95"],
-                "generation_count": wall["count"],
-                "generation_wall_mean_ms": wall["mean"],
-                "generation_wall_median_ms": wall["median"],
-                "generation_wall_p95_ms": wall["p95"],
-                "inner_time_source": INNER_TIME_FIELDS[communicator],
-                "inner_time_mean_ms": inner["mean"],
-                "inner_time_median_ms": inner["median"],
-                "inner_time_p95_ms": inner["p95"],
-                "unique_payload_mean_bytes": payload["mean"],
-                "unique_payload_median_bytes": payload["median"],
-                "unique_payload_p95_bytes": payload["p95"],
-                "rank_cov_mean": cov["mean"],
-                "rank_cov_median": cov["median"],
-                "rank_cov_p95": cov["p95"],
-                "client_phase_count": phase_elapsed["count"],
-                "client_phase_elapsed_mean_ms": phase_elapsed["mean"],
-                "client_phase_elapsed_median_ms": phase_elapsed["median"],
-                "client_phase_elapsed_p95_ms": phase_elapsed["p95"],
-                "request_count": request_count,
-                "request_latency_weighted_mean_ms": weighted_request_mean,
-                "request_latency_phase_p95_mean_ms": phase_p95["mean"],
-                "residual_flag_count": sum(bool(s.residual_flag) for s in selected),
-            }
-        )
+            cov = _stats([s.rank_cov for s in selected])
+            client = clients_by_label.get(parsed.label)
+            client_phases = (
+                [
+                    r
+                    for r in client.phases
+                    if r.integer("phase") >= start
+                    and (stop is None or r.integer("phase") < stop)
+                ]
+                if client
+                else []
+            )
+            phase_elapsed = _stats(
+                [record.number("phase_elapsed_s") * 1000 for record in client_phases]
+            )
+            request_count = sum(record.integer("requests") for record in client_phases)
+            weighted_request_mean = (
+                sum(
+                    record.number("request_latency_mean_ms")
+                    * record.integer("requests")
+                    for record in client_phases
+                )
+                / request_count
+                if request_count
+                else math.nan
+            )
+            phase_p95 = _stats(
+                [record.number("request_latency_p95_ms") for record in client_phases]
+            )
+            rows.append(
+                {
+                    "scope": scope,
+                    "start_rearrangement_id": start,
+                    "communicator": communicator,
+                    "rearrangement_count": outer["count"],
+                    "rearrangement_wall_mean_ms": outer["mean"],
+                    "rearrangement_wall_median_ms": outer["median"],
+                    "rearrangement_wall_p95_ms": outer["p95"],
+                    "generation_count": wall["count"],
+                    "generation_wall_mean_ms": wall["mean"],
+                    "generation_wall_median_ms": wall["median"],
+                    "generation_wall_p95_ms": wall["p95"],
+                    "inner_time_source": INNER_TIME_FIELDS[communicator],
+                    "inner_time_mean_ms": inner["mean"],
+                    "inner_time_median_ms": inner["median"],
+                    "inner_time_p95_ms": inner["p95"],
+                    "unique_payload_mean_bytes": payload["mean"],
+                    "unique_payload_median_bytes": payload["median"],
+                    "unique_payload_p95_bytes": payload["p95"],
+                    "total_io_mean_bytes": total_io["mean"],
+                    "total_io_median_bytes": total_io["median"],
+                    "total_io_p95_bytes": total_io["p95"],
+                    "rank_cov_mean": cov["mean"],
+                    "rank_cov_median": cov["median"],
+                    "rank_cov_p95": cov["p95"],
+                    "client_phase_count": phase_elapsed["count"],
+                    "client_phase_elapsed_mean_ms": phase_elapsed["mean"],
+                    "client_phase_elapsed_median_ms": phase_elapsed["median"],
+                    "client_phase_elapsed_p95_ms": phase_elapsed["p95"],
+                    "request_count": request_count,
+                    "request_latency_weighted_mean_ms": weighted_request_mean,
+                    "request_latency_phase_p95_mean_ms": phase_p95["mean"],
+                    "residual_flag_count": sum(bool(s.residual_flag) for s in selected),
+                }
+            )
     return rows
 
 
 def _comparison_delta_rows(
     comparison_rows: Sequence[dict[str, object]],
 ) -> list[dict[str, object]]:
-    by_communicator = {row["communicator"]: row for row in comparison_rows}
+    by_scope_and_communicator = {
+        (row["scope"], row["communicator"]): row for row in comparison_rows
+    }
     pairs = (
         ("candidate_vs_baseline", "baseline_nixl", "candidate_nixl"),
         ("pynccl_vs_candidate", "candidate_nixl", "pynccl_reference"),
@@ -917,27 +994,33 @@ def _comparison_delta_rows(
         "generation_wall_mean_ms",
         "inner_time_mean_ms",
         "unique_payload_mean_bytes",
+        "total_io_mean_bytes",
         "rank_cov_mean",
         "client_phase_elapsed_mean_ms",
         "request_latency_weighted_mean_ms",
     )
     rows = []
-    for comparison, reference_name, value_name in pairs:
-        reference_row = by_communicator[reference_name]
-        value_row = by_communicator[value_name]
-        for metric in metrics:
-            reference = float(reference_row[metric])
-            value = float(value_row[metric])
-            percent_change = 100 * (value / reference - 1) if reference else math.nan
-            rows.append(
-                {
-                    "comparison": comparison,
-                    "metric": metric,
-                    "reference": reference,
-                    "value": value,
-                    "percent_change": percent_change,
-                }
-            )
+    scopes = list(dict.fromkeys(str(row["scope"]) for row in comparison_rows))
+    for scope in scopes:
+        for comparison, reference_name, value_name in pairs:
+            reference_row = by_scope_and_communicator[(scope, reference_name)]
+            value_row = by_scope_and_communicator[(scope, value_name)]
+            for metric in metrics:
+                reference = float(reference_row[metric])
+                value = float(value_row[metric])
+                percent_change = (
+                    100 * (value / reference - 1) if reference else math.nan
+                )
+                rows.append(
+                    {
+                        "scope": scope,
+                        "comparison": comparison,
+                        "metric": metric,
+                        "reference": reference,
+                        "value": value,
+                        "percent_change": percent_change,
+                    }
+                )
     return rows
 
 
@@ -960,64 +1043,122 @@ def _write_summary(
         "# EPLB performance analysis",
         "",
         f"Validation: **{report.status}**",
-        "",
-        "## Communicator comparison",
-        "",
-        "| Communicator | Rearrangement mean (ms) | Generation mean (ms) | "
-        "Inner mean (ms) | Inner source | Payload mean (bytes) | Rank CoV mean | "
-        "Client phase mean (ms) | Request mean (ms) |",
-        "| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |",
     ]
-    for row in comparison_rows:
-        lines.append(
-            "| {communicator} | {outer} | {wall} | {inner} | {source} | "
-            "{payload} | {cov} | {phase} | {request} |".format(
-                communicator=row["communicator"],
-                outer=_format_number(row["rearrangement_wall_mean_ms"]),
-                wall=_format_number(row["generation_wall_mean_ms"]),
-                inner=_format_number(row["inner_time_mean_ms"]),
-                source=row["inner_time_source"],
-                payload=_format_number(row["unique_payload_mean_bytes"]),
-                cov=_format_number(row["rank_cov_mean"]),
-                phase=_format_number(row["client_phase_elapsed_mean_ms"]),
-                request=_format_number(row["request_latency_weighted_mean_ms"]),
+    scope_titles = {
+        "steady_state": "Steady-state",
+        "initialization": "Initialization",
+        "all": "Full-run including initialization",
+    }
+    scopes = list(dict.fromkeys(str(row["scope"]) for row in comparison_rows))
+    steady_start = next(
+        int(row["start_rearrangement_id"])
+        for row in comparison_rows
+        if row["scope"] == "steady_state"
+    )
+    for scope in scopes:
+        selected_comparison = [row for row in comparison_rows if row["scope"] == scope]
+        selected_deltas = [row for row in delta_rows if row["scope"] == scope]
+        start = selected_comparison[0]["start_rearrangement_id"]
+        scope_description = (
+            f"Includes rearrangement IDs {start} and later."
+            if scope == "steady_state"
+            else (
+                f"Includes rearrangement IDs 0 through {steady_start - 1}."
+                if scope == "initialization"
+                else "Includes every rearrangement ID."
             )
         )
+        lines.extend(
+            [
+                "",
+                f"## {scope_titles[scope]} communicator comparison",
+                "",
+                scope_description,
+                "",
+                "| Communicator | Rearrangement mean / median / P95 (ms) | "
+                "Generation mean / median / P95 (ms) | Inner mean (ms) | "
+                "Inner source | Unique payload mean (bytes) | Total I/O mean "
+                "(bytes) | Rank CoV mean | Client phase mean (ms) | Request "
+                "mean (ms) |",
+                "| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for row in selected_comparison:
+            lines.append(
+                "| {communicator} | {outer_mean} / {outer_median} / "
+                "{outer_p95} | {wall_mean} / {wall_median} / {wall_p95} | "
+                "{inner} | {source} | {payload} | {total_io} | {cov} | "
+                "{phase} | {request} |".format(
+                    communicator=row["communicator"],
+                    outer_mean=_format_number(row["rearrangement_wall_mean_ms"]),
+                    outer_median=_format_number(row["rearrangement_wall_median_ms"]),
+                    outer_p95=_format_number(row["rearrangement_wall_p95_ms"]),
+                    wall_mean=_format_number(row["generation_wall_mean_ms"]),
+                    wall_median=_format_number(row["generation_wall_median_ms"]),
+                    wall_p95=_format_number(row["generation_wall_p95_ms"]),
+                    inner=_format_number(row["inner_time_mean_ms"]),
+                    source=row["inner_time_source"],
+                    payload=_format_number(row["unique_payload_mean_bytes"]),
+                    total_io=_format_number(row["total_io_mean_bytes"]),
+                    cov=_format_number(row["rank_cov_mean"]),
+                    phase=_format_number(row["client_phase_elapsed_mean_ms"]),
+                    request=_format_number(row["request_latency_weighted_mean_ms"]),
+                )
+            )
+        lines.extend(
+            [
+                "",
+                "Negative changes mean the numerator communicator is lower/faster.",
+                "",
+                "| Comparison | Metric | Mean change |",
+                "| --- | --- | ---: |",
+            ]
+        )
+        for row in selected_deltas:
+            lines.append(
+                f"| {row['comparison']} | {row['metric']} | "
+                f"{_format_number(row['percent_change'])}% |"
+            )
     lines.extend(
         [
             "",
-            "## Mean changes",
+            "## Candidate critical-rank phase summaries",
             "",
-            "Negative values mean the numerator communicator is lower/faster.",
-            "",
-            "| Comparison | Metric | Change |",
-            "| --- | --- | ---: |",
+            "`decomposition_residual_ms` excludes READY wait, READ execution, "
+            "READ_DONE wait, and staging, so it contains measured protocol "
+            "residual. `unaccounted_residual_ms` also excludes "
+            "`protocol_residual_ms`; only unaccounted residual is flagged.",
         ]
     )
-    for row in delta_rows:
-        lines.append(
-            f"| {row['comparison']} | {row['metric']} | "
-            f"{_format_number(row['percent_change'])}% |"
-        )
-    lines.extend(
-        [
-            "",
-            "## Candidate critical-rank phase summary",
-            "",
-            "`residual_ms` is generation wall time minus READY wait, READ "
-            "execution, READ_DONE wait, and staging. It includes "
-            "`protocol_residual_ms`; do not add both residual columns together.",
-            "",
-            "| Phase | Count | Mean | Median | P95 |",
-            "| --- | ---: | ---: | ---: | ---: |",
-        ]
-    )
-    for row in phase_rows:
-        lines.append(
-            "| {phase} | {count} | {mean} | {median} | {p95} |".format(
-                **{name: _format_number(value) for name, value in row.items()}
+    for scope in scopes:
+        selected_phases = [row for row in phase_rows if row["scope"] == scope]
+        start = selected_phases[0]["start_rearrangement_id"]
+        scope_description = (
+            f"Includes rearrangement IDs {start} and later."
+            if scope == "steady_state"
+            else (
+                f"Includes rearrangement IDs 0 through {steady_start - 1}."
+                if scope == "initialization"
+                else "Includes every rearrangement ID."
             )
         )
+        lines.extend(
+            [
+                "",
+                f"### {scope_titles[scope]}",
+                "",
+                scope_description,
+                "",
+                "| Phase | Count | Mean | Median | P95 |",
+                "| --- | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for row in selected_phases:
+            lines.append(
+                "| {phase} | {count} | {mean} | {median} | {p95} |".format(
+                    **{name: _format_number(value) for name, value in row.items()}
+                )
+            )
     if report.warnings:
         lines.extend(["", "## Warnings", ""])
         lines.extend(f"- {warning}" for warning in report.warnings)
@@ -1026,6 +1167,8 @@ def _write_summary(
 
 def analyze(config: AnalysisConfig) -> tuple[ValidationReport, list[Path]]:
     """Run validation and analysis, returning the report and generated files."""
+    if config.steady_state_start_rearrangement < 0:
+        raise LogAnalysisError("steady-state start rearrangement must be non-negative")
     logs = [
         parse_log("baseline", config.baseline_log),
         parse_log("candidate", config.candidate_log),
@@ -1102,10 +1245,26 @@ def analyze(config: AnalysisConfig) -> tuple[ValidationReport, list[Path]]:
             negative_residual_tolerance_ms=config.negative_residual_tolerance_ms,
         )
     ]
+    steady_summaries = [
+        s
+        for s in summaries
+        if s.rearrangement_id >= config.steady_state_start_rearrangement
+    ]
+    if not steady_summaries:
+        raise LogAnalysisError(
+            "steady-state start rearrangement excludes all generation records"
+        )
     flagged = [s for s in summaries if s.residual_flag]
-    if flagged:
+    steady_flagged = [s for s in steady_summaries if s.residual_flag]
+    initialization_flagged = [
+        s
+        for s in flagged
+        if s.rearrangement_id < config.steady_state_start_rearrangement
+    ]
+    if steady_flagged:
         report.warnings.append(
-            f"{len(flagged)} candidate generations have residual flags"
+            f"{len(steady_flagged)} steady-state candidate generations have "
+            "unaccounted residual flags"
         )
 
     perf_path = config.output_dir / "performance_records.csv"
@@ -1117,8 +1276,16 @@ def analyze(config: AnalysisConfig) -> tuple[ValidationReport, list[Path]]:
     delta_path = config.output_dir / "comparison_deltas.csv"
     summary_path = config.output_dir / "summary.md"
 
-    phase_rows = _candidate_phase_rows(summaries)
-    comparison_rows = _comparison_rows(logs, summaries, clients)
+    phase_rows = _candidate_phase_rows(
+        summaries,
+        config.steady_state_start_rearrangement,
+    )
+    comparison_rows = _comparison_rows(
+        logs,
+        summaries,
+        clients,
+        config.steady_state_start_rearrangement,
+    )
     delta_rows = _comparison_delta_rows(comparison_rows)
     _write_csv(perf_path, _raw_perf_rows(logs))
     _write_csv(read_path, _raw_read_rows(logs))
@@ -1147,6 +1314,14 @@ def analyze(config: AnalysisConfig) -> tuple[ValidationReport, list[Path]]:
                     client.label: len(client.phases) for client in clients
                 },
                 "residual_flag_count": len(flagged),
+                "residual_flag_counts": {
+                    "all": len(flagged),
+                    "initialization": len(initialization_flagged),
+                    "steady_state": len(steady_flagged),
+                },
+                "steady_state_start_rearrangement": (
+                    config.steady_state_start_rearrangement
+                ),
             },
             indent=2,
         )
@@ -1179,6 +1354,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-ranks", type=int, default=8)
     parser.add_argument("--min-rearrangements", type=int, default=64)
     parser.add_argument("--expected-phases", type=int, default=64)
+    parser.add_argument(
+        "--steady-state-start-rearrangement",
+        type=int,
+        default=10,
+        help="first rearrangement ID included in steady-state summaries",
+    )
     parser.add_argument("--residual-threshold-pct", type=float, default=10.0)
     parser.add_argument(
         "--negative-residual-tolerance-ms",
@@ -1201,6 +1382,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         expected_ranks=args.expected_ranks,
         min_rearrangements=args.min_rearrangements,
         expected_phases=args.expected_phases,
+        steady_state_start_rearrangement=(args.steady_state_start_rearrangement),
         residual_threshold_pct=args.residual_threshold_pct,
         negative_residual_tolerance_ms=args.negative_residual_tolerance_ms,
     )
