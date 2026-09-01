@@ -67,7 +67,27 @@ def test_eplb_perf_ids_are_monotonic() -> None:
     assert [communicator.next_generation_id() for _ in range(3)] == [0, 1, 2]
 
 
-def test_move_to_buffer_counts_remote_payload_bytes() -> None:
+def test_move_to_buffer_records_common_communicator_api_perf(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock_ns = iter(
+        [
+            0,
+            1_000_000,
+            3_000_000,
+            4_000_000,
+            9_000_000,
+            10_000_000,
+            17_000_000,
+            18_000_000,
+            29_000_000,
+            31_000_000,
+        ]
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.eplb.rebalance_execute.time.perf_counter_ns",
+        lambda: next(clock_ns),
+    )
     communicator = _RecordingEplbCommunicator()
     expert_weights = [torch.zeros((1, 4), dtype=torch.float32)]
     expert_buffers = [torch.zeros_like(expert_weights[0])]
@@ -89,6 +109,14 @@ def test_move_to_buffer_counts_remote_payload_bytes() -> None:
     assert metadata.recv_transfers == 1
     assert communicator.sends == [(1, 0)]
     assert communicator.recvs == [(1, 1)]
+    host_perf = metadata.communicator_api_host_perf
+    assert host_perf.execute_calls == 1
+    assert host_perf.set_transfer_context_host_ms == 2
+    assert host_perf.add_send_host_ms == 5
+    assert host_perf.add_recv_host_ms == 7
+    assert host_perf.execute_host_ms == 11
+    assert host_perf.communicator_flow_host_ms == 31
+    assert host_perf.communicator_orchestration_host_ms == 6
 
 
 def test_pynccl_execute_records_gpu_events(
