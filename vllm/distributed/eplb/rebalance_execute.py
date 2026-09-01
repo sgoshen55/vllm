@@ -6,6 +6,7 @@ The actual execution of the rearrangement.
 This involves the exchange of expert weights between GPUs.
 """
 
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -22,6 +23,19 @@ from vllm.distributed.eplb.eplb_utils import CpuGpuEvent
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class CommunicatorApiHostPerf:
+    """Rank-local host time spent in the common communicator API."""
+
+    set_transfer_context_host_ms: float
+    add_send_host_ms: float
+    add_recv_host_ms: float
+    execute_host_ms: float
+    communicator_flow_host_ms: float
+    communicator_orchestration_host_ms: float
+    execute_calls: int
 
 
 @dataclass
@@ -48,6 +62,8 @@ class TransferMetadata:
     """Number of logical remote expert sends issued by this rank."""
     recv_transfers: int
     """Number of logical remote expert receives issued by this rank."""
+    communicator_api_host_perf: CommunicatorApiHostPerf
+    """Host-side timing for calls through the common communicator API."""
     backend_perf: EplbBackendPerf
     """Backend-specific timing fields for this layer transfer."""
 
@@ -96,6 +112,7 @@ def _log_layer_perf(
 ) -> None:
     generation_start, generation_end = record.generation_events
     staging_start, staging_end = record.staging_events
+    api_host_perf = record.transfer.communicator_api_host_perf
     fields: dict[str, int | float | str] = {
         "communicator": communicator.perf_label,
         "rearrangement_id": record.context.rearrangement_id,
@@ -109,6 +126,15 @@ def _log_layer_perf(
         "io_bytes": record.transfer.tx_bytes + record.transfer.rx_bytes,
         "send_transfers": record.transfer.send_transfers,
         "recv_transfers": record.transfer.recv_transfers,
+        "execute_calls": api_host_perf.execute_calls,
+        "set_transfer_context_host_ms": api_host_perf.set_transfer_context_host_ms,
+        "add_send_host_ms": api_host_perf.add_send_host_ms,
+        "add_recv_host_ms": api_host_perf.add_recv_host_ms,
+        "execute_host_ms": api_host_perf.execute_host_ms,
+        "communicator_flow_host_ms": api_host_perf.communicator_flow_host_ms,
+        "communicator_orchestration_host_ms": (
+            api_host_perf.communicator_orchestration_host_ms
+        ),
     }
     fields.update(record.transfer.backend_perf.fields)
     if record.transfer.backend_perf.gpu_events is not None:
@@ -343,11 +369,18 @@ def move_to_buffer(
                     for w, b in zip(expert_weights, expert_weights_buffers):
                         b[dst].copy_(w[src_local], non_blocking=True)
 
+    communicator_flow_start_ns = time.perf_counter_ns()
+    set_transfer_context_start_ns = time.perf_counter_ns()
     communicator.set_transfer_context(old_indices, layer_idx, perf_context)
+    set_transfer_context_host_ns = (
+        time.perf_counter_ns() - set_transfer_context_start_ns
+    )
     tx_bytes = 0
     rx_bytes = 0
     send_transfers = 0
     recv_transfers = 0
+    add_send_host_ns = 0
+    add_recv_host_ns = 0
 
     # 2. Post sends
     if send_count > 0:
@@ -382,7 +415,9 @@ def move_to_buffer(
             for dst in recv_ranks:
                 tx_bytes += sum(tensor.nbytes for tensor in expert_tensors)
                 send_transfers += 1
+                add_send_start_ns = time.perf_counter_ns()
                 communicator.add_send(expert_tensors, dst, expert_id=int(expert))
+                add_send_host_ns += time.perf_counter_ns() - add_send_start_ns
 
     # 3. Post recvs
     if recv_count > 0:
@@ -414,14 +449,37 @@ def move_to_buffer(
             recv_tensors = [b[dst] for b in expert_weights_buffers]
             rx_bytes += sum(tensor.nbytes for tensor in recv_tensors)
             recv_transfers += 1
+            add_recv_start_ns = time.perf_counter_ns()
             communicator.add_recv(
                 recv_tensors,
                 src,
                 expert_id=int(expert),
             )
+            add_recv_host_ns += time.perf_counter_ns() - add_recv_start_ns
 
     # 4. Execute transfers and wait for completion.
+    execute_start_ns = time.perf_counter_ns()
     communicator.execute()
+    execute_host_ns = time.perf_counter_ns() - execute_start_ns
+    communicator_flow_host_ns = time.perf_counter_ns() - communicator_flow_start_ns
+    measured_api_host_ns = (
+        set_transfer_context_host_ns
+        + add_send_host_ns
+        + add_recv_host_ns
+        + execute_host_ns
+    )
+    communicator_api_host_perf = CommunicatorApiHostPerf(
+        set_transfer_context_host_ms=set_transfer_context_host_ns / 1_000_000,
+        add_send_host_ms=add_send_host_ns / 1_000_000,
+        add_recv_host_ms=add_recv_host_ns / 1_000_000,
+        execute_host_ms=execute_host_ns / 1_000_000,
+        communicator_flow_host_ms=communicator_flow_host_ns / 1_000_000,
+        communicator_orchestration_host_ms=(
+            communicator_flow_host_ns - measured_api_host_ns
+        )
+        / 1_000_000,
+        execute_calls=1,
+    )
     backend_perf = communicator.take_last_backend_perf()
     return TransferMetadata(
         is_unchanged=is_unchanged,
@@ -434,6 +492,7 @@ def move_to_buffer(
         rx_bytes=rx_bytes,
         send_transfers=send_transfers,
         recv_transfers=recv_transfers,
+        communicator_api_host_perf=communicator_api_host_perf,
         backend_perf=backend_perf,
     )
 
