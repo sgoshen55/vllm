@@ -36,6 +36,16 @@ def _perf_line(
             "generation_wall_ms=12 staging_ms=1.5 tx_bytes=0 rx_bytes=100 "
             "io_bytes=100 send_transfers=0 recv_transfers=1 "
         )
+    add_send_ms = 0.5 + rank / 10
+    add_recv_ms = 0.7 + rank / 10
+    execute_ms = 4 + rank
+    flow_ms = 0.1 + add_send_ms + add_recv_ms + execute_ms + 0.2
+    common += (
+        "execute_calls=1 set_transfer_context_host_ms=0.1 "
+        f"add_send_host_ms={add_send_ms} add_recv_host_ms={add_recv_ms} "
+        f"execute_host_ms={execute_ms} communicator_flow_host_ms={flow_ms} "
+        "communicator_orchestration_host_ms=0.2 "
+    )
     if communicator == "baseline_nixl":
         return common + (
             f"backend_wall_ms={8 + rank} transfer_wait_ms={7 + rank} "
@@ -148,7 +158,7 @@ def test_analyze_exports_scopes_and_flags_only_unaccounted_residual(
     )
 
     assert report.status == "PASS"
-    assert len(outputs) == 9
+    assert len(outputs) == 10
     validation = json.loads((output_dir / "validation_report.json").read_text())
     assert validation["residual_flag_count"] == 0
     assert validation["residual_flag_counts"] == {
@@ -202,6 +212,21 @@ def test_analyze_exports_scopes_and_flags_only_unaccounted_residual(
         "unaccounted_residual_pct",
     }
     assert {row["scope"] for row in phase_rows} == {"all", "steady_state"}
+    api_rows = _read_csv(output_dir / "communicator_api_host_time.csv")
+    assert {row["aggregation"] for row in api_rows} == {
+        "all_rank_records",
+        "critical_flow_rank",
+    }
+    candidate_critical = next(
+        row
+        for row in api_rows
+        if row["scope"] == "steady_state"
+        and row["communicator"] == "candidate_nixl"
+        and row["aggregation"] == "critical_flow_rank"
+    )
+    assert candidate_critical["sample_count"] == "1"
+    assert float(candidate_critical["communicator_flow_host_mean_ms"]) == 6.7
+    assert float(candidate_critical["execute_calls_mean"]) == 1
 
 
 def test_analyze_separates_initialization_and_steady_state(tmp_path: Path) -> None:
@@ -309,6 +334,34 @@ def test_validation_reports_malformed_numeric_field(tmp_path: Path) -> None:
 
     assert report.status == "FAIL"
     assert any("tx_bytes must be an integer" in error for error in report.errors)
+
+
+def test_validation_rejects_invalid_common_api_host_time(tmp_path: Path) -> None:
+    log_path = tmp_path / "baseline.log"
+    rank_zero = _perf_line("baseline_nixl", 0).replace(
+        "execute_calls=1",
+        "execute_calls=2",
+    )
+    rank_one = _perf_line("baseline_nixl", 1).replace(
+        "communicator_flow_host_ms=6.7",
+        "communicator_flow_host_ms=7.7",
+    )
+    log_path.write_text(
+        "INFO Rearranged experts in 0.1 s.\n"
+        f"INFO EPLB_PERF {rank_zero}\n"
+        f"INFO EPLB_PERF {rank_one}\n"
+        f"INFO EPLB_READ {_read_line('baseline_nixl')}\n"
+    )
+
+    report = validate_log(
+        parse_log("baseline", log_path),
+        expected_ranks=2,
+        min_rearrangements=1,
+    )
+
+    assert report.status == "FAIL"
+    assert any("execute_calls must equal 1" in error for error in report.errors)
+    assert any("host-time phases do not sum" in error for error in report.errors)
 
 
 def test_client_validation_rejects_prompt_mismatch(tmp_path: Path) -> None:

@@ -33,6 +33,17 @@ FATAL_PATTERN = re.compile(
     r"CUDA out of memory"
 )
 
+COMMON_API_PHASE_FIELDS = (
+    "set_transfer_context_host_ms",
+    "add_send_host_ms",
+    "add_recv_host_ms",
+    "execute_host_ms",
+    "communicator_orchestration_host_ms",
+)
+COMMON_API_HOST_TIME_FIELDS = (
+    *COMMON_API_PHASE_FIELDS,
+    "communicator_flow_host_ms",
+)
 COMMON_PERF_FIELDS = {
     "communicator",
     "rearrangement_id",
@@ -46,7 +57,8 @@ COMMON_PERF_FIELDS = {
     "io_bytes",
     "send_transfers",
     "recv_transfers",
-}
+    "execute_calls",
+} | set(COMMON_API_HOST_TIME_FIELDS)
 BACKEND_PERF_FIELDS = {
     "baseline_nixl": {"backend_wall_ms", "transfer_wait_ms", "barrier_ms"},
     "candidate_nixl": {
@@ -415,7 +427,7 @@ def validate_log(
             rank_key = record.rank_key
             for name in ("tx_bytes", "rx_bytes", "io_bytes"):
                 record.integer(name)
-            for name in ("send_transfers", "recv_transfers"):
+            for name in ("send_transfers", "recv_transfers", "execute_calls"):
                 record.integer(name)
             for name in sorted(
                 field for field in required_perf if field.endswith("_ms")
@@ -430,6 +442,7 @@ def validate_log(
                 "io_bytes",
                 "send_transfers",
                 "recv_transfers",
+                "execute_calls",
             ):
                 if record.integer(name) < 0:
                     report.errors.append(
@@ -442,6 +455,22 @@ def validate_log(
                 report.errors.append(
                     f"{parsed.label}:{record.line_number}: io_bytes does not equal "
                     "tx_bytes + rx_bytes"
+                )
+            if record.integer("execute_calls") != 1:
+                report.errors.append(
+                    f"{parsed.label}:{record.line_number}: execute_calls must equal 1"
+                )
+            common_api_phase_sum = sum(
+                record.number(name) for name in COMMON_API_PHASE_FIELDS
+            )
+            if not math.isclose(
+                record.number("communicator_flow_host_ms"),
+                common_api_phase_sum,
+                abs_tol=0.005,
+            ):
+                report.errors.append(
+                    f"{parsed.label}:{record.line_number}: common API host-time "
+                    "phases do not sum to communicator_flow_host_ms"
                 )
         except (KeyError, LogAnalysisError) as exc:
             report.errors.append(f"{parsed.label}: {exc}")
@@ -880,6 +909,102 @@ def _candidate_phase_rows(
     return rows
 
 
+def _common_api_host_time_rows(
+    logs: Sequence[ParsedLog],
+    steady_state_start: int,
+) -> list[dict[str, object]]:
+    rows = []
+    scopes = [
+        ("steady_state", steady_state_start, None),
+        ("all", 0, None),
+    ]
+    if steady_state_start:
+        scopes.insert(1, ("initialization", 0, steady_state_start))
+
+    for scope, start, stop in scopes:
+        for parsed in logs:
+            selected = [
+                record
+                for record in parsed.perf_records
+                if record.integer("rearrangement_id") >= start
+                and (
+                    stop is None or record.integer("rearrangement_id") < stop
+                )
+            ]
+            by_generation: dict[GenerationKey, list[PerfRecord]] = defaultdict(list)
+            for record in selected:
+                by_generation[record.generation_key].append(record)
+            critical_records = [
+                max(
+                    records,
+                    key=lambda record: record.number(
+                        "communicator_flow_host_ms"
+                    ),
+                )
+                for records in by_generation.values()
+            ]
+            rank_flow_cov = []
+            for records in by_generation.values():
+                flow_values = [
+                    record.number("communicator_flow_host_ms")
+                    for record in records
+                ]
+                flow_mean = statistics.mean(flow_values)
+                rank_flow_cov.append(
+                    statistics.pstdev(flow_values) / flow_mean
+                    if flow_mean
+                    else 0.0
+                )
+
+            for aggregation, records in (
+                ("all_rank_records", selected),
+                ("critical_flow_rank", critical_records),
+            ):
+                timer_stats = {
+                    name: _stats([record.number(name) for record in records])
+                    for name in COMMON_API_HOST_TIME_FIELDS
+                }
+                flow_mean = float(
+                    timer_stats["communicator_flow_host_ms"]["mean"]
+                )
+                component_sum_mean = sum(
+                    float(timer_stats[name]["mean"])
+                    for name in COMMON_API_PHASE_FIELDS
+                )
+                row: dict[str, object] = {
+                    "scope": scope,
+                    "start_rearrangement_id": start,
+                    "aggregation": aggregation,
+                    "communicator": parsed.expected_communicator,
+                    "sample_count": len(records),
+                    "generation_count": len(by_generation),
+                    "component_sum_mean_ms": component_sum_mean,
+                    "envelope_gap_mean_ms": flow_mean - component_sum_mean,
+                    "rank_flow_cov_mean": _stats(rank_flow_cov)["mean"],
+                    "rank_flow_cov_median": _stats(rank_flow_cov)["median"],
+                    "rank_flow_cov_p95": _stats(rank_flow_cov)["p95"],
+                }
+                for name, stats in timer_stats.items():
+                    prefix = name.removesuffix("_ms")
+                    row[f"{prefix}_mean_ms"] = stats["mean"]
+                    row[f"{prefix}_median_ms"] = stats["median"]
+                    row[f"{prefix}_p95_ms"] = stats["p95"]
+                    if name in COMMON_API_PHASE_FIELDS:
+                        row[f"{prefix}_mean_share_pct"] = (
+                            100 * float(stats["mean"]) / flow_mean
+                            if flow_mean
+                            else math.nan
+                        )
+                for name in ("send_transfers", "recv_transfers", "execute_calls"):
+                    values = [record.integer(name) for record in records]
+                    row[f"{name}_total"] = sum(values)
+                    row[f"{name}_mean"] = _stats(values)["mean"]
+                    row[f"{name}_median"] = _stats(values)["median"]
+                    row[f"{name}_p95"] = _stats(values)["p95"]
+                rows.append(row)
+    return rows
+
+
 def _comparison_rows(
     logs: Sequence[ParsedLog],
     summaries: Sequence[GenerationSummary],
@@ -1037,6 +1162,7 @@ def _write_summary(
     comparison_rows: Sequence[dict[str, object]],
     delta_rows: Sequence[dict[str, object]],
     phase_rows: Sequence[dict[str, object]],
+    api_host_rows: Sequence[dict[str, object]],
     report: ValidationReport,
 ) -> None:
     lines = [
@@ -1118,6 +1244,68 @@ def _write_summary(
             lines.append(
                 f"| {row['comparison']} | {row['metric']} | "
                 f"{_format_number(row['percent_change'])}% |"
+            )
+    lines.extend(
+        [
+            "",
+            "## Steady-state common communicator API host-time breakdown",
+            "",
+            f"Includes rearrangement IDs {steady_start} and later. Values are "
+            "rank-local host time. Component means include their share of the "
+            "complete communicator-flow envelope. The detailed CSV also includes "
+            "median and P95.",
+        ]
+    )
+    aggregation_titles = {
+        "all_rank_records": "All rank-local layer records",
+        "critical_flow_rank": "Critical host-flow rank per layer/generation",
+    }
+    steady_api_rows = [
+        row for row in api_host_rows if row["scope"] == "steady_state"
+    ]
+    for aggregation, title in aggregation_titles.items():
+        selected_api = [
+            row
+            for row in steady_api_rows
+            if row["aggregation"] == aggregation
+        ]
+        lines.extend(
+            [
+                "",
+                f"### {title}",
+                "",
+                "| Communicator | Context mean ms (%) | add_send mean ms (%) | "
+                "add_recv mean ms (%) | execute mean ms (%) | Orchestration mean "
+                "ms (%) | Flow mean ms | Rank flow CoV mean | Send / recv / "
+                "execute calls mean |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for row in selected_api:
+            component_values = []
+            for prefix in (
+                "set_transfer_context_host",
+                "add_send_host",
+                "add_recv_host",
+                "execute_host",
+                "communicator_orchestration_host",
+            ):
+                component_values.append(
+                    f"{_format_number(row[f'{prefix}_mean_ms'])} "
+                    f"({_format_number(row[f'{prefix}_mean_share_pct'])}%)"
+                )
+            lines.append(
+                "| {communicator} | {components[0]} | {components[1]} | "
+                "{components[2]} | {components[3]} | {components[4]} | {flow} | "
+                "{cov} | {send} / {recv} / {execute} |".format(
+                    communicator=row["communicator"],
+                    components=component_values,
+                    flow=_format_number(row["communicator_flow_host_mean_ms"]),
+                    cov=_format_number(row["rank_flow_cov_mean"]),
+                    send=_format_number(row["send_transfers_mean"]),
+                    recv=_format_number(row["recv_transfers_mean"]),
+                    execute=_format_number(row["execute_calls_mean"]),
+                )
             )
     lines.extend(
         [
@@ -1273,6 +1461,7 @@ def analyze(config: AnalysisConfig) -> tuple[ValidationReport, list[Path]]:
     generation_path = config.output_dir / "generation_summary.csv"
     phase_path = config.output_dir / "candidate_phase_summary.csv"
     comparison_path = config.output_dir / "communicator_comparison.csv"
+    api_host_path = config.output_dir / "communicator_api_host_time.csv"
     delta_path = config.output_dir / "comparison_deltas.csv"
     summary_path = config.output_dir / "summary.md"
 
@@ -1286,6 +1475,10 @@ def analyze(config: AnalysisConfig) -> tuple[ValidationReport, list[Path]]:
         clients,
         config.steady_state_start_rearrangement,
     )
+    api_host_rows = _common_api_host_time_rows(
+        logs,
+        config.steady_state_start_rearrangement,
+    )
     delta_rows = _comparison_delta_rows(comparison_rows)
     _write_csv(perf_path, _raw_perf_rows(logs))
     _write_csv(read_path, _raw_read_rows(logs))
@@ -1294,8 +1487,16 @@ def analyze(config: AnalysisConfig) -> tuple[ValidationReport, list[Path]]:
     _write_csv(generation_path, _generation_rows(summaries))
     _write_csv(phase_path, phase_rows)
     _write_csv(comparison_path, comparison_rows)
+    _write_csv(api_host_path, api_host_rows)
     _write_csv(delta_path, delta_rows)
-    _write_summary(summary_path, comparison_rows, delta_rows, phase_rows, report)
+    _write_summary(
+        summary_path,
+        comparison_rows,
+        delta_rows,
+        phase_rows,
+        api_host_rows,
+        report,
+    )
 
     report_path.write_text(
         json.dumps(
@@ -1334,6 +1535,7 @@ def analyze(config: AnalysisConfig) -> tuple[ValidationReport, list[Path]]:
         generation_path,
         phase_path,
         comparison_path,
+        api_host_path,
         delta_path,
         summary_path,
     ]
