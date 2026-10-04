@@ -3,6 +3,7 @@
 """NIXL EPLB sync protocol tests; run without GPU or NIXL."""
 
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -175,8 +176,18 @@ def make_communicator(
     return communicator
 
 
-def begin_layer(communicator: NixlEplbCommunicator) -> None:
-    communicator.set_transfer_context(OLD_INDICES, LAYER)
+NO_OP_STREAM = SimpleNamespace(synchronize=lambda: None)
+
+
+def begin_layer(
+    communicator: NixlEplbCommunicator,
+    *,
+    layer: int = LAYER,
+    stream: SimpleNamespace = NO_OP_STREAM,
+) -> None:
+    # The test host has no accelerator; stand in for the current stream.
+    with mock.patch.object(torch.accelerator, "current_stream", return_value=stream):
+        communicator.set_transfer_context(OLD_INDICES, layer)
 
 
 def deliver(agent: FakeNixlAgent, sender: int, notification: NixlEplbNotification):
@@ -357,6 +368,24 @@ def test_expired_uses_injected_clock_and_timeout() -> None:
     assert tracker.expired()
 
 
+def test_set_transfer_context_synchronizes_stream_before_opening_generation() -> None:
+    agent = FakeNixlAgent()
+    communicator = make_communicator(rank=0, agent=agent)
+    generations_at_sync: list[int | None] = []
+
+    def synchronize() -> None:
+        generations_at_sync.append(communicator._tracker.active_generation)
+
+    recorder = SimpleNamespace(synchronize=synchronize)
+    begin_layer(communicator, stream=recorder)
+    assert generations_at_sync == [None]
+    assert communicator._tracker.active_generation == 0
+
+    legacy = make_communicator(rank=0, agent=agent, protocol=False)
+    begin_layer(legacy, stream=recorder)
+    assert generations_at_sync == [None]
+
+
 def test_add_send_registers_reader_and_sends_ready() -> None:
     agent = FakeNixlAgent()
     sender = make_communicator(rank=0, agent=agent)
@@ -487,7 +516,7 @@ def test_execute_with_nothing_enqueued_drains_once_and_skips_barrier(
         communicator, "_post_read_barrier", lambda: pytest.fail("barrier ran")
     )
     for layer in range(2):
-        communicator.set_transfer_context(OLD_INDICES, layer)
+        begin_layer(communicator, layer=layer)
         communicator.execute()
     assert agent.poll_calls == 2
     assert communicator._tracker.completed_generation == 1

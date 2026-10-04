@@ -633,6 +633,12 @@ class NixlEplbCommunicator(EplbCommunicator):
             for row in rank_experts
         ]
         if self._protocol:
+            # Drain the stream before any READ of this layer is posted: the
+            # previous layer's copies out of expert_buffer have finished, so the
+            # NIC may write into those rows, and every prior write to this
+            # rank's expert weights is complete.
+            with gpu_sync_allowed():
+                torch.accelerator.current_stream().synchronize()
             self._tracker.begin_generation(self._generation)
             self._generation += 1
 
