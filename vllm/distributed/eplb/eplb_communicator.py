@@ -3,11 +3,14 @@
 """EPLB communicator implementations and factory."""
 
 import contextlib
+import struct
 import time
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import timedelta
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -300,6 +303,180 @@ class TorchDistXCCLStagedEplbCommunicator(EplbCommunicator):
                 req.wait()
 
 
+NIXL_EPLB_PROTOCOL_TIMEOUT_SECONDS = 300.0
+
+
+def _normalize_nixl_agent_name(agent_name: str | bytes) -> str:
+    if isinstance(agent_name, bytes):
+        return agent_name.decode()
+    return agent_name
+
+
+class TransferKey(NamedTuple):
+    """One NIXL EPLB transfer: one expert row of one source read by one reader."""
+
+    generation: int
+    layer: int
+    expert: int
+    source: int
+    reader: int
+
+    @property
+    def source_key(self) -> tuple[int, int, int, int]:
+        return (self.generation, self.layer, self.expert, self.source)
+
+
+@dataclass(frozen=True)
+class NixlEplbNotification:
+    """READY (sender to reader) or READ_DONE (reader to sender) for one key."""
+
+    READY = 1
+    READ_DONE = 2
+
+    kind: int
+    key: TransferKey
+
+    _STRUCT = struct.Struct("!4sBBQIIII")
+    _MAGIC = b"EPLB"
+    _VERSION = 1
+
+    def encode(self) -> bytes:
+        return self._STRUCT.pack(self._MAGIC, self._VERSION, self.kind, *self.key)
+
+    @classmethod
+    def decode(cls, payload: bytes) -> "NixlEplbNotification":
+        if len(payload) != cls._STRUCT.size:
+            raise ValueError(
+                f"NIXL EPLB notification has {len(payload)} bytes, "
+                f"expected {cls._STRUCT.size}"
+            )
+        magic, version, kind, *key = cls._STRUCT.unpack(payload)
+        if magic != cls._MAGIC or version != cls._VERSION:
+            raise ValueError(
+                f"NIXL EPLB notification header mismatch: {magic!r} v{version}"
+            )
+        if kind not in (cls.READY, cls.READ_DONE):
+            raise ValueError(f"NIXL EPLB notification has unknown kind {kind}")
+        return cls(kind, TransferKey(*key))
+
+
+class NixlEplbTransferTracker:
+    """READY and READ_DONE bookkeeping for one communicator, one open generation.
+
+    Holds gates G1 (READY per transfer) and G3 (READ_DONE per declared
+    reader); posted READs (G2) stay in the communicator.
+    """
+
+    def __init__(
+        self,
+        rank: int,
+        timeout_seconds: float = NIXL_EPLB_PROTOCOL_TIMEOUT_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._rank = rank
+        self._timeout_seconds = timeout_seconds
+        self._clock = clock
+        self.active_generation: int | None = None
+        self.completed_generation = -1
+        self.deadline = float("inf")
+        # source key -> readers declared in add_send / confirmed by READ_DONE.
+        self.expected: dict[tuple[int, int, int, int], set[int]] = {}
+        self.completed: dict[tuple[int, int, int, int], set[int]] = {}
+        # READY tokens; the value is True once take_ready consumed the token.
+        self.ready: dict[TransferKey, bool] = {}
+
+    def begin_generation(self, generation: int) -> None:
+        if self.active_generation is not None:
+            raise RuntimeError(
+                f"NIXL EPLB generation {self.active_generation} is still open"
+            )
+        if generation <= self.completed_generation:
+            raise RuntimeError(
+                f"NIXL EPLB generation {generation} does not follow "
+                f"{self.completed_generation}"
+            )
+        self.active_generation = generation
+        self.deadline = self._clock() + self._timeout_seconds
+
+    def add_expected_reader(
+        self, source_key: tuple[int, int, int, int], reader: int
+    ) -> None:
+        if source_key[0] != self.active_generation:
+            raise RuntimeError(
+                f"NIXL EPLB add_send outside the open generation: {source_key}"
+            )
+        self.expected.setdefault(source_key, set()).add(reader)
+
+    def record_ready(self, key: TransferKey, sender: int) -> None:
+        if sender != key.source or key.reader != self._rank:
+            raise RuntimeError(
+                f"NIXL EPLB READY misrouted: key={key}, sender={sender}, "
+                f"rank={self._rank}"
+            )
+        if key.generation <= self.completed_generation:
+            raise RuntimeError(f"NIXL EPLB READY for closed generation: key={key}")
+        # Held until take_ready; the generation may not have begun yet.
+        self.ready.setdefault(key, False)
+
+    def take_ready(self, key: TransferKey) -> bool:
+        if key.generation != self.active_generation:
+            raise RuntimeError(
+                f"NIXL EPLB take_ready outside the open generation: {key}"
+            )
+        if self.ready.get(key) is False:
+            self.ready[key] = True
+            return True
+        return False
+
+    def record_read_done(self, key: TransferKey, sender: int) -> None:
+        if sender != key.reader or key.source != self._rank:
+            raise RuntimeError(
+                f"NIXL EPLB READ_DONE misrouted: key={key}, sender={sender}, "
+                f"rank={self._rank}"
+            )
+        if key.generation != self.active_generation:
+            raise RuntimeError(
+                f"NIXL EPLB READ_DONE outside the open generation "
+                f"{self.active_generation}: {key}"
+            )
+        if key.reader not in self.expected.get(key.source_key, set()):
+            raise RuntimeError(f"NIXL EPLB READ_DONE from undeclared reader: {key}")
+        self.completed.setdefault(key.source_key, set()).add(key.reader)
+
+    def sender_complete(self) -> bool:
+        return all(
+            readers <= self.completed.get(source_key, set())
+            for source_key, readers in self.expected.items()
+        )
+
+    def expired(self) -> bool:
+        return self._clock() >= self.deadline
+
+    def end_generation(self, success: bool) -> None:
+        generation = self.active_generation
+        if generation is None:
+            raise RuntimeError("NIXL EPLB end_generation: no open generation")
+        if success:
+            unconsumed = [
+                key
+                for key, consumed in self.ready.items()
+                if key.generation == generation and not consumed
+            ]
+            if unconsumed:
+                raise RuntimeError(
+                    f"NIXL EPLB READY without matching add_recv: {unconsumed}"
+                )
+        self.completed_generation = generation
+        self.active_generation = None
+        self.expected.clear()
+        self.completed.clear()
+        self.ready = {
+            key: consumed
+            for key, consumed in self.ready.items()
+            if key.generation > generation
+        }
+
+
 class NixlEplbCommunicator(EplbCommunicator):
     """EPLB communicator backed by NIXL READ transfers."""
 
@@ -308,6 +485,7 @@ class NixlEplbCommunicator(EplbCommunicator):
         cpu_group: ProcessGroup,
         all_expert_weights: Sequence[Sequence[torch.Tensor]],
         expert_buffer: Sequence[torch.Tensor],
+        enable_sync_protocol: bool = False,
     ) -> None:
         """Create a NIXL-backed EPLB communicator.
 
@@ -315,6 +493,8 @@ class NixlEplbCommunicator(EplbCommunicator):
             cpu_group: CPU process group for metadata exchange.
             all_expert_weights: Expert weight tensors for all MoE layers.
             expert_buffer: Pre-allocated receive buffer tensors.
+            enable_sync_protocol: Replace the per-layer barrier with the
+                READY/READ_DONE protocol. Synchronous EPLB only.
 
         """
         assert all_expert_weights, (
@@ -354,6 +534,16 @@ class NixlEplbCommunicator(EplbCommunicator):
         # Per-rank expert_id -> physical row; set by set_transfer_context.
         self._expert_to_src_row: list[dict[int, int]] | None = None
         self._layer_idx: int | None = None
+        self._protocol = enable_sync_protocol
+        self._tracker = NixlEplbTransferTracker(self._rank)
+        self._generation = 0
+        # Receives waiting for their READY: key -> (local_descs, remote_descs).
+        self._pending_reads: dict[
+            TransferKey,
+            tuple[list[tuple[int, int, int]], list[tuple[int, int, int]]],
+        ] = {}
+        # Posted READs not yet observed DONE.
+        self._inflight: set[int] = set()
 
         nixl_agent_config = nixl_utils.nixl_agent_config
         config = (
@@ -366,6 +556,7 @@ class NixlEplbCommunicator(EplbCommunicator):
         # NIXL registration handles; deregistered in __del__.
         self._registered_descs: list[object] = []
         self._remote_agents: dict[int, str] = {}
+        self._remote_agent_ranks: dict[str, int] = {}
         # peer -> (layer, tensor) -> (base_ptr, bytes_per_expert, dev_id).
         self._remote_send_meta: dict[
             int, dict[tuple[int, int], tuple[int, int, int]]
@@ -411,9 +602,22 @@ class NixlEplbCommunicator(EplbCommunicator):
         dst_rank: int,
         expert_id: int,
     ) -> None:
-        # No-op: NIXL READ is receiver-initiated. The sender's expert
-        # weights are pre-registered and always readable in-place.
-        pass
+        if not self._protocol:
+            # No-op: NIXL READ is receiver-initiated. The sender's expert
+            # weights are pre-registered and always readable in-place.
+            return
+        generation = self._tracker.active_generation
+        assert generation is not None and self._layer_idx is not None, (
+            "set_transfer_context() must be called before add_send()"
+        )
+        key = TransferKey(generation, self._layer_idx, expert_id, self._rank, dst_rank)
+        # Register the reader before sending READY: its READ_DONE can only
+        # follow this READY.
+        self._tracker.add_expected_reader(key.source_key, dst_rank)
+        self._nixl_wrapper.send_notif(
+            self._remote_agents[dst_rank],
+            NixlEplbNotification(NixlEplbNotification.READY, key).encode(),
+        )
 
     def set_transfer_context(self, old_indices: np.ndarray, layer_idx: int) -> None:
         assert not self._xfer_entries, (
@@ -428,6 +632,9 @@ class NixlEplbCommunicator(EplbCommunicator):
             {int(eid): i for i, eid in enumerate(row) if eid != -1}
             for row in rank_experts
         ]
+        if self._protocol:
+            self._tracker.begin_generation(self._generation)
+            self._generation += 1
 
     def add_recv(
         self,
@@ -435,12 +642,38 @@ class NixlEplbCommunicator(EplbCommunicator):
         src_rank: int,
         expert_id: int,
     ) -> None:
-        # Build NIXL descriptors and issue the RDMA READ immediately,
-        # overlapping the transfer with the remaining Python loop in
-        # move_to_buffer.
         assert self._expert_to_src_row is not None and self._layer_idx is not None, (
             "set_transfer_context() must be called before add_recv()"
         )
+        local_descs, remote_descs = self._build_read_descs(tensors, src_rank, expert_id)
+        if not self._protocol:
+            # Issue the RDMA READ immediately, overlapping the transfer with
+            # the remaining Python loop in move_to_buffer.
+            self._post_read(src_rank, local_descs, remote_descs, b"")
+            return
+        generation = self._tracker.active_generation
+        assert generation is not None
+        key = TransferKey(generation, self._layer_idx, expert_id, src_rank, self._rank)
+        self._drain_notifications()
+        if key in self._pending_reads or self._tracker.ready.get(key):
+            raise RuntimeError(f"NIXL EPLB duplicate add_recv: {key}")
+        if self._tracker.take_ready(key):
+            self._post_read(
+                src_rank,
+                local_descs,
+                remote_descs,
+                NixlEplbNotification(NixlEplbNotification.READ_DONE, key).encode(),
+            )
+        else:
+            self._pending_reads[key] = (local_descs, remote_descs)
+
+    def _build_read_descs(
+        self,
+        tensors: list[torch.Tensor],
+        src_rank: int,
+        expert_id: int,
+    ) -> tuple[list[tuple[int, int, int]], list[tuple[int, int, int]]]:
+        assert self._expert_to_src_row is not None and self._layer_idx is not None
         src_row = self._expert_to_src_row[src_rank][expert_id]
         layer_idx = self._layer_idx
 
@@ -467,12 +700,38 @@ class NixlEplbCommunicator(EplbCommunicator):
                     remote_dev,
                 )
             )
+        return local_descs, remote_descs
 
+    def _post_read(
+        self,
+        src: int,
+        local_descs: list[tuple[int, int, int]],
+        remote_descs: list[tuple[int, int, int]],
+        notif_msg: bytes,
+    ) -> None:
         local_h, remote_h, xfer_h = self._create_peer_xfer(
-            src_rank, local_descs, remote_descs
+            src, local_descs, remote_descs, notif_msg=notif_msg
         )
-        self._nixl_wrapper.transfer(xfer_h)
+        state = self._nixl_wrapper.transfer(xfer_h)
         self._xfer_entries.append((local_h, remote_h, xfer_h))
+        if state != "DONE":
+            self._inflight.add(xfer_h)
+
+    def _drain_notifications(self) -> None:
+        for agent_name, payloads in self._nixl_wrapper.get_new_notifs().items():
+            sender = self._remote_agent_ranks.get(
+                _normalize_nixl_agent_name(agent_name)
+            )
+            if sender is None:
+                raise RuntimeError(
+                    f"NIXL EPLB notification from unknown agent {agent_name!r}"
+                )
+            for payload in payloads:
+                notification = NixlEplbNotification.decode(payload)
+                if notification.kind == NixlEplbNotification.READY:
+                    self._tracker.record_ready(notification.key, sender)
+                else:
+                    self._tracker.record_read_done(notification.key, sender)
 
     def _init_remote_agents(self) -> None:
         local_metadata = self._nixl_wrapper.get_agent_metadata()
@@ -485,9 +744,16 @@ class NixlEplbCommunicator(EplbCommunicator):
                 continue
             peer_metadata = gathered_metadata[peer]
             assert peer_metadata is not None
-            self._remote_agents[peer] = self._nixl_wrapper.add_remote_agent(
-                peer_metadata
-            )
+            agent_handle = self._nixl_wrapper.add_remote_agent(peer_metadata)
+            agent_name = _normalize_nixl_agent_name(agent_handle)
+            if agent_name in self._remote_agent_ranks:
+                raise RuntimeError(
+                    "NIXL EPLB remote agent name is not unique: "
+                    f"agent={agent_name!r}, "
+                    f"ranks={self._remote_agent_ranks[agent_name]},{peer}"
+                )
+            self._remote_agents[peer] = agent_handle
+            self._remote_agent_ranks[agent_name] = peer
 
     def _init_registered_buffers(self) -> None:
         all_tensors: list[torch.Tensor] = []
@@ -564,11 +830,13 @@ class NixlEplbCommunicator(EplbCommunicator):
         src: int,
         local_descs: list[tuple[int, int, int]],
         remote_descs: list[tuple[int, int, int]],
+        notif_msg: bytes = b"",
     ) -> tuple[int, int, int]:
         """Create a batched xfer for multiple descriptors from one peer.
 
         Each element in *local_descs* / *remote_descs* is an
-        ``(address, size, device_id)`` tuple.
+        ``(address, size, device_id)`` tuple. A non-empty *notif_msg*
+        is delivered to the peer once the READ completes.
 
         Returns ``(local_dlist, remote_dlist, xfer_handle)``.
         """
@@ -595,6 +863,7 @@ class NixlEplbCommunicator(EplbCommunicator):
             indices,
             remote_handle,
             indices,
+            notif_msg=notif_msg,
         )
         return (local_handle, remote_handle, xfer_handle)
 
@@ -619,9 +888,54 @@ class NixlEplbCommunicator(EplbCommunicator):
             "if any add_recv() calls were made"
         )
         try:
-            self._wait_for_all_transfers([x[2] for x in self._xfer_entries])
+            if not self._protocol:
+                self._wait_for_all_transfers([x[2] for x in self._xfer_entries])
 
-            self._post_read_barrier()
+                self._post_read_barrier()
+                return
+            while True:
+                self._drain_notifications()
+                # G1: post every pending READ whose READY has arrived.
+                for key in list(self._pending_reads):
+                    if self._tracker.take_ready(key):
+                        local_descs, remote_descs = self._pending_reads.pop(key)
+                        self._post_read(
+                            key.source,
+                            local_descs,
+                            remote_descs,
+                            NixlEplbNotification(
+                                NixlEplbNotification.READ_DONE, key
+                            ).encode(),
+                        )
+                # G2: every posted READ is DONE.
+                for handle in list(self._inflight):
+                    state = self._nixl_wrapper.check_xfer_state(handle)
+                    if state == "DONE":
+                        self._inflight.remove(handle)
+                    elif state != "PROC":
+                        raise RuntimeError(f"NIXL transfer failed with state={state}")
+                # G3: every reader declared in add_send has sent READ_DONE.
+                if (
+                    not self._pending_reads
+                    and not self._inflight
+                    and self._tracker.sender_complete()
+                ):
+                    break
+                if self._tracker.expired():
+                    completed = self._tracker.completed
+                    missing_read_done = {
+                        source_key: sorted(readers - completed.get(source_key, set()))
+                        for source_key, readers in self._tracker.expected.items()
+                        if readers - completed.get(source_key, set())
+                    }
+                    raise RuntimeError(
+                        "NIXL EPLB transfers timed out: "
+                        f"READY missing for {sorted(self._pending_reads)}; "
+                        f"{len(self._inflight)} READs in flight; "
+                        f"READ_DONE missing from {missing_read_done}"
+                    )
+                time.sleep(0.0005)
+            self._tracker.end_generation(success=True)
         finally:
             for local_h, remote_h, xfer_h in self._xfer_entries:
                 with contextlib.suppress(Exception):
@@ -631,8 +945,12 @@ class NixlEplbCommunicator(EplbCommunicator):
                 with contextlib.suppress(Exception):
                     self._nixl_wrapper.release_dlist_handle(remote_h)
             self._xfer_entries.clear()
+            self._inflight.clear()
+            self._pending_reads.clear()
             self._expert_to_src_row = None
             self._layer_idx = None
+            if self._protocol and self._tracker.active_generation is not None:
+                self._tracker.end_generation(success=False)
 
     def __del__(self) -> None:
         with contextlib.suppress(Exception):
@@ -704,6 +1022,7 @@ def create_eplb_communicator(
     backend: str,
     expert_weights: Sequence[Sequence[torch.Tensor]],
     expert_buffer: Sequence[torch.Tensor],
+    enable_nixl_sync_protocol: bool = False,
 ) -> EplbCommunicator:
     """Create an EPLB communicator for the given backend.
 
@@ -724,6 +1043,9 @@ def create_eplb_communicator(
             zero-copy RDMA reads.
         expert_buffer: Pre-allocated receive buffer tensors (one per
             weight tensor in a single layer).
+        enable_nixl_sync_protocol: For ``"nixl"`` on regular process groups,
+            replace the per-layer barrier with the READY/READ_DONE protocol.
+            Ignored by other backends and by stateless (elastic EP) groups.
 
     """
     first_layer = expert_weights[0] if expert_weights else []
@@ -800,6 +1122,7 @@ def create_eplb_communicator(
                 cpu_group=group_coordinator.cpu_group,
                 all_expert_weights=expert_weights,
                 expert_buffer=expert_buffer,
+                enable_sync_protocol=enable_nixl_sync_protocol and not is_stateless,
             )
         except Exception as exc:
             raise RuntimeError(
