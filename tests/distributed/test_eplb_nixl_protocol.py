@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NIXL EPLB sync protocol tests; run without GPU or NIXL."""
 
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest import mock
 
@@ -141,20 +142,29 @@ def agent_name(rank: int) -> str:
 
 def make_communicator(
     rank: int,
-    agent: FakeNixlAgent,
+    agent: object,
     *,
     protocol: bool = True,
-    clock: FakeClock | None = None,
+    clock: Callable[[], float] | None = None,
     timeout_seconds: float = 300.0,
+    world_size: int = WORLD_SIZE,
+    num_local_experts: int = 1,
+    remote_send_meta: dict[int, dict[tuple[int, int], tuple[int, int, int]]]
+    | None = None,
 ) -> NixlEplbCommunicator:
     """Build a communicator around a fake agent, bypassing NIXL init and the
     metadata collectives; mirrors the fields set in __init__."""
-    peers = [peer for peer in range(WORLD_SIZE) if peer != rank]
+    peers = [peer for peer in range(world_size) if peer != rank]
+    if remote_send_meta is None:
+        remote_send_meta = {
+            peer: {(LAYER, 0): (0x1000 * (peer + 1), TENSOR.nbytes, 0)}
+            for peer in peers
+        }
     communicator = object.__new__(NixlEplbCommunicator)
     communicator._cpu_group = None
     communicator._rank = rank
-    communicator._world_size = WORLD_SIZE
-    communicator._num_local_experts = 1
+    communicator._world_size = world_size
+    communicator._num_local_experts = num_local_experts
     communicator._cuda_device_id = 0
     communicator._nixl_wrapper = agent
     communicator._nixl_memory_type = "VRAM"
@@ -170,9 +180,7 @@ def make_communicator(
     communicator._inflight = set()
     communicator._remote_agents = {peer: agent_name(peer) for peer in peers}
     communicator._remote_agent_ranks = {agent_name(peer): peer for peer in peers}
-    communicator._remote_send_meta = {
-        peer: {(LAYER, 0): (0x1000 * (peer + 1), TENSOR.nbytes, 0)} for peer in peers
-    }
+    communicator._remote_send_meta = remote_send_meta
     return communicator
 
 

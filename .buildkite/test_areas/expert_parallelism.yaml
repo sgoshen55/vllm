@@ -12,10 +12,12 @@ steps:
   - tests/distributed/test_eplb_algo.py
   - tests/distributed/test_eplb_utils.py
   - tests/distributed/test_eplb_nixl_protocol.py
+  - tests/distributed/test_eplb_nixl_fabric.py
   commands:
   - pytest -v -s distributed/test_eplb_algo.py
   - pytest -v -s distributed/test_eplb_utils.py
   - pytest -v -s distributed/test_eplb_nixl_protocol.py
+  - pytest -v -s distributed/test_eplb_nixl_fabric.py
   mirror:
     amd:
       label: ":amd: (MI355 DPX) EPLB Algorithm"
@@ -29,6 +31,7 @@ steps:
       - tests/distributed/test_eplb_algo.py
       - tests/distributed/test_eplb_utils.py
       - tests/distributed/test_eplb_nixl_protocol.py
+      - tests/distributed/test_eplb_nixl_fabric.py
       - vllm/platforms/rocm.py
 
 - label: ":nvidia: (L4) EPLB Execution"
