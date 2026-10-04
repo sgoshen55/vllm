@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import random
+import time
+import uuid
+from datetime import timedelta
 
 import pytest
 import torch
@@ -10,7 +13,9 @@ import torch.distributed
 import vllm.distributed.eplb.eplb_communicator as eplb_comm
 import vllm.utils.gpu_sync_debug as gsd
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.distributed import nixl_utils
 from vllm.distributed.eplb.eplb_communicator import (
+    _normalize_nixl_agent_name,
     create_eplb_communicator,
     has_nixl,
 )
@@ -324,7 +329,12 @@ def assert_verification_synced(local_ok: bool, msg: str, cpu_group) -> None:
 
 
 def create_eplb_communicator_or_raise(
-    *, group_coordinator, backend, expert_weights, expert_buffer
+    *,
+    group_coordinator,
+    backend,
+    expert_weights,
+    expert_buffer,
+    enable_nixl_sync_protocol=False,
 ):
     try:
         return create_eplb_communicator(
@@ -332,11 +342,195 @@ def create_eplb_communicator_or_raise(
             backend=backend,
             expert_weights=expert_weights,
             expert_buffer=expert_buffer,
+            enable_nixl_sync_protocol=enable_nixl_sync_protocol,
         )
     except Exception as exc:
         raise RuntimeError(
             f"Failed to create EPLB communicator for backend={backend}: {exc}"
         ) from exc
+
+
+def skip_unless_backend_available(eplb_communicator: str | None, world_size: int):
+    if eplb_communicator == "nixl" and not has_nixl():
+        pytest.skip("NIXL is not available")
+    if eplb_communicator == "nixl" and current_platform.is_xpu():
+        pytest.skip("NIXL does not support XPU")
+    if eplb_communicator in ("torch_nccl", "pynccl") and not torch.cuda.is_available():
+        pytest.skip(f"{eplb_communicator} requires CUDA")
+    if eplb_communicator == "torch_xccl" and not current_platform.is_xpu():
+        pytest.skip("torch_xccl requires XPU")
+    if torch.accelerator.device_count() < world_size:
+        pytest.skip(f"Need at least {world_size} GPUs to run the test")
+
+
+# (backend, enable_nixl_sync_protocol); the nixl backend runs in both modes.
+NIXL_SYNC_PROTOCOL = pytest.param("nixl", True, id="nixl-sync-protocol")
+NIXL_MODES = [pytest.param("nixl", False, id="nixl"), NIXL_SYNC_PROTOCOL]
+COMMUNICATOR_MODES = [
+    pytest.param("torch_nccl", False, id="torch_nccl"),
+    pytest.param("torch_gloo", False, id="torch_gloo"),
+    pytest.param("torch_xccl", False, id="torch_xccl"),
+    pytest.param("pynccl", False, id="pynccl"),
+    *NIXL_MODES,
+]
+
+
+def _test_nixl_read_completion_notification_worker(
+    env: dict[str, str],
+    world_size: int,
+    run_id: str,
+) -> None:
+    assert world_size == 2
+    set_env_vars_and_device(env)
+
+    vllm_config = VllmConfig()
+    vllm_config.parallel_config.tensor_parallel_size = world_size
+    with set_current_vllm_config(vllm_config):
+        ensure_model_parallel_initialized(
+            tensor_model_parallel_size=world_size,
+            pipeline_model_parallel_size=1,
+        )
+
+        rank = torch.distributed.get_rank()
+        peer_rank = 1 - rank
+        cpu_group = get_tp_group().cpu_group
+        device = torch.device(f"cuda:{rank}")
+
+        expected = torch.arange(1 << 20, dtype=torch.float32, device=device)
+        buffer = expected if rank == 0 else torch.zeros_like(expected)
+        torch.accelerator.synchronize(device)
+
+        wrapper_cls = nixl_utils.NixlWrapper
+        config_cls = nixl_utils.nixl_agent_config
+        assert wrapper_cls is not None and config_cls is not None
+        config = config_cls(capture_telemetry=False, backends=["UCX"])
+        agent = wrapper_cls(f"eplb-notif-{rank}-{run_id}", config)
+
+        registration = agent.get_reg_descs([buffer])
+        agent.register_memory(registration, backends=["UCX"])
+
+        local_info = {
+            "metadata": agent.get_agent_metadata(),
+            "buffer": (buffer.data_ptr(), buffer.nbytes, buffer.get_device()),
+        }
+        gathered_info: list[dict[str, object] | None] = [None] * world_size
+        torch.distributed.all_gather_object(
+            gathered_info,
+            local_info,
+            group=cpu_group,
+        )
+
+        peer_info = gathered_info[peer_rank]
+        assert peer_info is not None
+        peer_metadata = peer_info["metadata"]
+        assert isinstance(peer_metadata, bytes)
+        peer_agent_handle = agent.add_remote_agent(peer_metadata)
+        peer_agent_name = _normalize_nixl_agent_name(peer_agent_handle)
+
+        notification = f"eplb-read-done:{run_id}".encode()
+        local_handle = None
+        remote_handle = None
+        xfer_handle = None
+        matching_senders: list[str] = []
+
+        if rank == 1:
+            source_info = gathered_info[0]
+            assert source_info is not None
+            source_buffer = source_info["buffer"]
+            assert isinstance(source_buffer, tuple)
+
+            local_descs = agent.get_xfer_descs(
+                [(buffer.data_ptr(), buffer.nbytes, buffer.get_device())],
+                "VRAM",
+            )
+            remote_descs = agent.get_xfer_descs([source_buffer], "VRAM")
+            local_handle = agent.prep_xfer_dlist(
+                "NIXL_INIT_AGENT",
+                local_descs,
+                backends=["UCX"],
+            )
+            remote_handle = agent.prep_xfer_dlist(
+                peer_agent_handle,
+                remote_descs,
+                backends=["UCX"],
+            )
+            xfer_handle = agent.make_prepped_xfer(
+                "READ",
+                local_handle,
+                [0],
+                remote_handle,
+                [0],
+                notif_msg=notification,
+                backends=["UCX"],
+            )
+            assert agent.query_xfer_backend(xfer_handle) == "UCX"
+
+            state = agent.transfer(xfer_handle)
+            assert state in ("DONE", "PROC")
+            deadline = time.monotonic() + 30
+            while state == "PROC" and time.monotonic() < deadline:
+                state = agent.check_xfer_state(xfer_handle)
+                if state == "PROC":
+                    time.sleep(0.0005)
+            assert state == "DONE"
+        else:
+            received: list[bytes] = []
+            deadline = time.monotonic() + 30
+            while notification not in received and time.monotonic() < deadline:
+                notifications = agent.get_new_notifs(backends=["UCX"])
+                for sender, payloads in notifications.items():
+                    for payload in payloads:
+                        if payload == notification:
+                            matching_senders.append(sender)
+                            received.append(payload)
+                if notification not in received:
+                    time.sleep(0.0005)
+            assert received == [notification]
+            buffer.fill_(-1)
+            torch.accelerator.synchronize(device)
+
+        torch.distributed.monitored_barrier(
+            group=cpu_group,
+            timeout=timedelta(seconds=30),
+        )
+        if rank == 1:
+            torch.accelerator.synchronize(device)
+            assert torch.equal(buffer, expected)
+        torch.distributed.monitored_barrier(
+            group=cpu_group,
+            timeout=timedelta(seconds=30),
+        )
+
+        if xfer_handle is not None:
+            agent.release_xfer_handle(xfer_handle)
+        if local_handle is not None:
+            agent.release_dlist_handle(local_handle)
+        if remote_handle is not None:
+            agent.release_dlist_handle(remote_handle)
+        agent.deregister_memory(registration, backends=["UCX"])
+        agent.remove_remote_agent(peer_agent_handle)
+        if rank == 0:
+            assert matching_senders == [peer_agent_name], (
+                "NIXL READ notification sender mismatch: "
+                f"actual={matching_senders!r}, expected={[peer_agent_name]!r}"
+            )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="NIXL READ notification capability proof requires NVIDIA CUDA",
+)
+@pytest.mark.skipif(not has_nixl(), reason="NIXL is not available")
+def test_nixl_read_completion_notification() -> None:
+    """Prove that a receiver-initiated READ notifies its source on completion."""
+    world_size = 2
+    if torch.accelerator.device_count() < world_size:
+        pytest.skip(f"Need at least {world_size} GPUs to run the test")
+    distributed_run(
+        _test_nixl_read_completion_notification_worker,
+        world_size,
+        uuid.uuid4().hex[:8],
+    )
 
 
 def _test_async_transfer_layer_without_mtp_worker(
@@ -465,6 +659,9 @@ def _test_rearrange_expert_weights_with_redundancy(
     num_local_experts,
     num_logical_experts,
     eplb_communicator: str,
+    enable_nixl_sync_protocol: bool = False,
+    skew_ms: int = 0,
+    rounds: int = 1,
 ) -> None:
     # Initialize model parallel (using tensor parallel as an entrypoint
     # to expert parallel)
@@ -501,17 +698,6 @@ def _test_rearrange_expert_weights_with_redundancy(
             redundancy_config,
         )
 
-        # Create new expert indices (with redundancy)
-        new_redundancy_config = create_redundancy_config(
-            num_logical_experts, total_physical_experts
-        )
-        new_indices = create_expert_indices_with_redundancy(
-            num_layers,
-            num_logical_experts,
-            total_physical_experts,
-            new_redundancy_config,
-        )
-
         # Create expert weights
         expert_weights = create_expert_weights(
             num_layers, num_local_experts, hidden_sizes, ep_rank, device, old_indices
@@ -523,44 +709,68 @@ def _test_rearrange_expert_weights_with_redundancy(
             backend=eplb_communicator,
             expert_weights=expert_weights,
             expert_buffer=expert_buffer,
+            enable_nixl_sync_protocol=enable_nixl_sync_protocol,
         )
+        if skew_ms:
+            set_transfer_context = communicator.set_transfer_context
 
-        # Execute weight rearrangement
-        rearrange_expert_weights_inplace(
-            old_indices,
-            new_indices,
-            expert_weights,
-            expert_buffer,
-            ep_group,
-            communicator,
-        )
+            def delayed_set_transfer_context(old_indices, layer_idx: int) -> None:
+                if layer_idx % world_size == ep_rank:
+                    time.sleep(skew_ms / 1000)
+                set_transfer_context(old_indices, layer_idx)
 
-    # Verify the rearrangement result
-    local_ok = verify_expert_weights_after_shuffle(
-        expert_weights,
-        new_indices,
-        hidden_sizes,
-        ep_rank,
-        num_local_experts,
-    )
+            communicator.set_transfer_context = delayed_set_transfer_context
 
-    local_ok = (
-        verify_redundant_experts_have_same_weights(
-            expert_weights,
-            new_indices,
-            hidden_sizes,
-            ep_rank,
-            world_size,
-            num_local_experts,
-            cpu_group=cpu_group,
-        )
-        and local_ok
-    )
-    assert_verification_synced(
-        local_ok,
-        "Rearrange verification failed on at least one rank. See logs for details.",
-        cpu_group=cpu_group,
-    )
+        for _ in range(rounds):
+            # Create new expert indices (with redundancy)
+            new_redundancy_config = create_redundancy_config(
+                num_logical_experts, total_physical_experts
+            )
+            new_indices = create_expert_indices_with_redundancy(
+                num_layers,
+                num_logical_experts,
+                total_physical_experts,
+                new_redundancy_config,
+            )
+
+            # Execute weight rearrangement
+            rearrange_expert_weights_inplace(
+                old_indices,
+                new_indices,
+                expert_weights,
+                expert_buffer,
+                ep_group,
+                communicator,
+            )
+
+            # Verify the rearrangement result
+            local_ok = verify_expert_weights_after_shuffle(
+                expert_weights,
+                new_indices,
+                hidden_sizes,
+                ep_rank,
+                num_local_experts,
+            )
+
+            local_ok = (
+                verify_redundant_experts_have_same_weights(
+                    expert_weights,
+                    new_indices,
+                    hidden_sizes,
+                    ep_rank,
+                    world_size,
+                    num_local_experts,
+                    cpu_group=cpu_group,
+                )
+                and local_ok
+            )
+            assert_verification_synced(
+                local_ok,
+                "Rearrange verification failed on at least one rank. "
+                "See logs for details.",
+                cpu_group=cpu_group,
+            )
+            old_indices = new_indices
 
 
 @pytest.mark.parametrize(
@@ -587,7 +797,7 @@ def _test_rearrange_expert_weights_with_redundancy(
     ],
 )
 @pytest.mark.parametrize(
-    "eplb_communicator", ["torch_nccl", "torch_gloo", "torch_xccl", "pynccl", "nixl"]
+    "eplb_communicator, enable_nixl_sync_protocol", COMMUNICATOR_MODES
 )
 def test_rearrange_expert_weights_with_redundancy(
     world_size,
@@ -595,18 +805,10 @@ def test_rearrange_expert_weights_with_redundancy(
     num_local_experts,
     num_logical_experts,
     eplb_communicator,
+    enable_nixl_sync_protocol,
 ):
     """Test the functionality of rearranging expert weights with redundancy."""
-    if eplb_communicator == "nixl" and not has_nixl():
-        pytest.skip("NIXL is not available")
-    if eplb_communicator == "nixl" and current_platform.is_xpu():
-        pytest.skip("NIXL does not support XPU")
-    if eplb_communicator in ("torch_nccl", "pynccl") and not torch.cuda.is_available():
-        pytest.skip(f"{eplb_communicator} requires CUDA")
-    if eplb_communicator == "torch_xccl" and not current_platform.is_xpu():
-        pytest.skip("torch_xccl requires XPU")
-    if torch.accelerator.device_count() < world_size:
-        pytest.skip(f"Need at least {world_size} GPUs to run the test")
+    skip_unless_backend_available(eplb_communicator, world_size)
     distributed_run(
         _test_rearrange_expert_weights_with_redundancy,
         world_size,
@@ -614,10 +816,65 @@ def test_rearrange_expert_weights_with_redundancy(
         num_local_experts,
         num_logical_experts,
         eplb_communicator,
+        enable_nixl_sync_protocol,
     )
 
 
-def _test_rearrange_expert_weights_no_change(env, world_size) -> None:
+@pytest.mark.parametrize(
+    "world_size,num_layers,num_local_experts,num_logical_experts",
+    [
+        (2, 4, 2, 3),
+        (4, 4, 2, 5),
+    ],
+)
+@pytest.mark.parametrize("eplb_communicator, enable_nixl_sync_protocol", NIXL_MODES)
+def test_rearrange_expert_weights_with_layer_skew(
+    world_size,
+    num_layers,
+    num_local_experts,
+    num_logical_experts,
+    eplb_communicator,
+    enable_nixl_sync_protocol,
+):
+    """Rank layer_idx % world_size starts each layer 50 ms late, so its peers
+    wait on it while the other ranks run ahead into the next layer."""
+    skip_unless_backend_available(eplb_communicator, world_size)
+    distributed_run(
+        _test_rearrange_expert_weights_with_redundancy,
+        world_size,
+        num_layers,
+        num_local_experts,
+        num_logical_experts,
+        eplb_communicator,
+        enable_nixl_sync_protocol,
+        50,  # skew_ms
+    )
+
+
+@pytest.mark.parametrize("eplb_communicator, enable_nixl_sync_protocol", NIXL_MODES)
+def test_rearrange_expert_weights_soak(eplb_communicator, enable_nixl_sync_protocol):
+    """25 consecutive random rearrangements on one communicator over 4 GPUs."""
+    world_size, num_layers, num_local_experts, num_logical_experts = 4, 2, 2, 5
+    skip_unless_backend_available(eplb_communicator, world_size)
+    distributed_run(
+        _test_rearrange_expert_weights_with_redundancy,
+        world_size,
+        num_layers,
+        num_local_experts,
+        num_logical_experts,
+        eplb_communicator,
+        enable_nixl_sync_protocol,
+        0,  # skew_ms
+        25,  # rounds
+    )
+
+
+def _test_rearrange_expert_weights_no_change(
+    env,
+    world_size,
+    eplb_communicator: str | None = None,
+    enable_nixl_sync_protocol: bool = False,
+) -> None:
     set_env_vars_and_device(env)
 
     vllm_config = VllmConfig()
@@ -662,12 +919,16 @@ def _test_rearrange_expert_weights_no_change(env, world_size) -> None:
             original_weights.append(layer_copy)
 
         expert_buffer = [torch.empty_like(w) for w in expert_weights[0]]
-        default_backend = "torch_xccl" if current_platform.is_xpu() else "torch_nccl"
+        if eplb_communicator is None:
+            eplb_communicator = (
+                "torch_xccl" if current_platform.is_xpu() else "torch_nccl"
+            )
         communicator = create_eplb_communicator_or_raise(
             group_coordinator=ep_group_coordinator,
-            backend=default_backend,
+            backend=eplb_communicator,
             expert_weights=expert_weights,
             expert_buffer=expert_buffer,
+            enable_nixl_sync_protocol=enable_nixl_sync_protocol,
         )
 
         # Execute rearrangement (should be no change)
@@ -736,15 +997,22 @@ def test_async_transfer_layer_without_mtp(
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
-def test_rearrange_expert_weights_no_change(world_size):
+@pytest.mark.parametrize(
+    "eplb_communicator, enable_nixl_sync_protocol",
+    [pytest.param(None, False, id="default"), NIXL_SYNC_PROTOCOL],
+)
+def test_rearrange_expert_weights_no_change(
+    world_size, eplb_communicator, enable_nixl_sync_protocol
+):
     """Test that when the indices do not change, the weights should remain
     unchanged.
     """
-    if torch.accelerator.device_count() < world_size:
-        pytest.skip(f"Need at least {world_size} GPUs to run the test")
+    skip_unless_backend_available(eplb_communicator, world_size)
     distributed_run(
         _test_rearrange_expert_weights_no_change,
         world_size,
+        eplb_communicator,
+        enable_nixl_sync_protocol,
     )
 
 
