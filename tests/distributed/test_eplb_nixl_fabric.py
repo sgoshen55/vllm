@@ -34,7 +34,7 @@ from .test_eplb_nixl_protocol import NO_OP_STREAM, agent_name, make_communicator
 SEEDS = [0, 1, 2]
 HIDDEN_SIZES = [16, 32]
 JOIN_TIMEOUT_SECONDS = 30.0
-MISMATCH_MESSAGES = ("undeclared reader", "without matching add_recv", "timed out")
+MISMATCH_MESSAGES = ("not outstanding", "without matching add_recv", "timed out")
 
 
 class Fabric:

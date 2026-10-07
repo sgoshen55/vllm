@@ -379,9 +379,8 @@ class NixlEplbTransferTracker:
         self.active_generation: int | None = None
         self.completed_generation = -1
         self.deadline = float("inf")
-        # source key -> readers declared in add_send / confirmed by READ_DONE.
-        self.expected: dict[tuple[int, int, int, int], set[int]] = {}
-        self.completed: dict[tuple[int, int, int, int], set[int]] = {}
+        # source key -> readers declared in add_send whose READ_DONE is still owed.
+        self.outstanding: dict[tuple[int, int, int, int], set[int]] = {}
         # READY tokens; the value is True once take_ready consumed the token.
         self.ready: dict[TransferKey, bool] = {}
 
@@ -405,7 +404,7 @@ class NixlEplbTransferTracker:
             raise RuntimeError(
                 f"NIXL EPLB add_send outside the open generation: {source_key}"
             )
-        self.expected.setdefault(source_key, set()).add(reader)
+        self.outstanding.setdefault(source_key, set()).add(reader)
 
     def record_ready(self, key: TransferKey, sender: int) -> None:
         if sender != key.source or key.reader != self._rank:
@@ -439,15 +438,18 @@ class NixlEplbTransferTracker:
                 f"NIXL EPLB READ_DONE outside the open generation "
                 f"{self.active_generation}: {key}"
             )
-        if key.reader not in self.expected.get(key.source_key, set()):
-            raise RuntimeError(f"NIXL EPLB READ_DONE from undeclared reader: {key}")
-        self.completed.setdefault(key.source_key, set()).add(key.reader)
+        readers = self.outstanding.get(key.source_key, set())
+        if key.reader not in readers:
+            raise RuntimeError(
+                "NIXL EPLB READ_DONE from a reader that is not outstanding "
+                f"(undeclared or already confirmed): {key}"
+            )
+        readers.remove(key.reader)
+        if not readers:
+            del self.outstanding[key.source_key]
 
     def sender_complete(self) -> bool:
-        return all(
-            readers <= self.completed.get(source_key, set())
-            for source_key, readers in self.expected.items()
-        )
+        return not self.outstanding
 
     def expired(self) -> bool:
         return self._clock() >= self.deadline
@@ -468,8 +470,7 @@ class NixlEplbTransferTracker:
                 )
         self.completed_generation = generation
         self.active_generation = None
-        self.expected.clear()
-        self.completed.clear()
+        self.outstanding.clear()
         self.ready = {
             key: consumed
             for key, consumed in self.ready.items()
@@ -928,17 +929,11 @@ class NixlEplbCommunicator(EplbCommunicator):
                 ):
                     break
                 if self._tracker.expired():
-                    completed = self._tracker.completed
-                    missing_read_done = {
-                        source_key: sorted(readers - completed.get(source_key, set()))
-                        for source_key, readers in self._tracker.expected.items()
-                        if readers - completed.get(source_key, set())
-                    }
                     raise RuntimeError(
                         "NIXL EPLB transfers timed out: "
                         f"READY missing for {sorted(self._pending_reads)}; "
                         f"{len(self._inflight)} READs in flight; "
-                        f"READ_DONE missing from {missing_read_done}"
+                        f"READ_DONE missing from {self._tracker.outstanding}"
                     )
                 time.sleep(0.0005)
             self._tracker.end_generation(success=True)

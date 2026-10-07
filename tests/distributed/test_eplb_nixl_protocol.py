@@ -300,17 +300,30 @@ def test_ready_rejects_wrong_route(sender: int, rank: int) -> None:
         tracker.record_ready(make_key(source=0, reader=1), sender=sender)
 
 
-def test_read_done_requires_declared_reader() -> None:
+def test_read_done_requires_outstanding_reader() -> None:
     tracker = make_tracker(rank=0)
     tracker.begin_generation(0)
     key = make_key(source=0, reader=1)
-    with pytest.raises(RuntimeError, match="undeclared reader"):
+    with pytest.raises(RuntimeError, match="not outstanding"):
         tracker.record_read_done(key, sender=1)
     tracker.add_expected_reader(key.source_key, reader=1)
     assert not tracker.sender_complete()
     tracker.record_read_done(key, sender=1)
-    tracker.record_read_done(key, sender=1)
     assert tracker.sender_complete()
+
+
+def test_second_read_done_for_same_reader_raises() -> None:
+    tracker = make_tracker(rank=0)
+    tracker.begin_generation(0)
+    key = make_key(source=0, reader=1)
+    tracker.add_expected_reader(key.source_key, reader=1)
+    tracker.add_expected_reader(key.source_key, reader=2)
+    tracker.record_read_done(key, sender=1)
+    assert tracker.outstanding == {key.source_key: {2}}
+    with pytest.raises(RuntimeError, match="not outstanding"):
+        tracker.record_read_done(key, sender=1)
+    tracker.record_read_done(key._replace(reader=2), sender=2)
+    assert not tracker.outstanding
 
 
 def test_read_done_is_strict_to_the_open_generation() -> None:
@@ -362,7 +375,7 @@ def test_end_generation_prunes_only_the_closed_generation() -> None:
     tracker.record_ready(future, sender=0)
     tracker.end_generation(success=True)
     assert set(tracker.ready) == {future}
-    assert not tracker.expected and not tracker.completed
+    assert not tracker.outstanding
 
 
 def test_expired_uses_injected_clock_and_timeout() -> None:
@@ -400,7 +413,7 @@ def test_add_send_registers_reader_and_sends_ready() -> None:
     begin_layer(sender)
     sender.add_send([TENSOR], dst_rank=1, expert_id=EXPERT)
     key = make_key()
-    assert sender._tracker.expected == {key.source_key: {1}}
+    assert sender._tracker.outstanding == {key.source_key: {1}}
     assert agent.sent_notifications == [
         (agent_name(1), NixlEplbNotification(READY, key).encode())
     ]
@@ -417,7 +430,7 @@ def test_add_send_registers_reader_before_sending_ready(monkeypatch) -> None:
     monkeypatch.setattr(agent, "send_notif", fail)
     with pytest.raises(ConnectionError):
         sender.add_send([TENSOR], dst_rank=1, expert_id=EXPERT)
-    assert sender._tracker.expected == {make_key().source_key: {1}}
+    assert sender._tracker.outstanding == {make_key().source_key: {1}}
 
 
 def test_add_recv_without_ready_queues_and_posts_nothing() -> None:
@@ -494,7 +507,7 @@ def test_execute_waits_for_read_done_from_every_declared_reader() -> None:
     )
     begin_layer(sender)
     sender.add_send([TENSOR], dst_rank=1, expert_id=EXPERT)
-    expected = re.escape(f"READ_DONE missing from {{{make_key().source_key!r}: [1]}}")
+    expected = re.escape(f"READ_DONE missing from {{{make_key().source_key!r}: {{1}}}}")
     with pytest.raises(RuntimeError, match=expected):
         sender.execute()
     assert sender._tracker.active_generation is None
