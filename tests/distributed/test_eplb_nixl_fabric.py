@@ -13,6 +13,7 @@ from collections.abc import Callable
 from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
 import pytest
 import torch
 
@@ -21,7 +22,10 @@ from vllm.distributed.eplb.eplb_communicator import (
     NixlEplbNotification,
     NixlEplbTransferTracker,
 )
-from vllm.distributed.eplb.rebalance_execute import rearrange_expert_weights_inplace
+from vllm.distributed.eplb.rebalance_execute import (
+    get_ep_ranks_with_experts_batch,
+    rearrange_expert_weights_inplace,
+)
 
 from .test_eplb_execute import (
     create_expert_indices_with_redundancy,
@@ -190,6 +194,7 @@ def make_cluster(
     protocol: bool = True,
     clock: Callable[[], float] | None = None,
     timeout_seconds: float = 300.0,
+    indices: torch.Tensor | None = None,
 ) -> SimpleNamespace:
     random.seed(seed)
     torch.manual_seed(seed)
@@ -200,7 +205,7 @@ def make_cluster(
         num_logical_experts=num_logical_experts,
         fabric=Fabric(seed),
     )
-    cluster.indices = new_placement(cluster)
+    cluster.indices = new_placement(cluster) if indices is None else indices
     cluster.weights = [
         create_expert_weights(
             num_layers,
@@ -319,11 +324,11 @@ def run_rounds(cluster: SimpleNamespace, rounds: int) -> None:
         assert_quiescent(cluster, layers_run=(round_idx + 1) * cluster.num_layers)
 
 
-def delay_layer_start(communicator: NixlEplbCommunicator, rng: random.Random):
+def delay_layer_start(communicator: NixlEplbCommunicator, seconds: float) -> None:
     original = communicator.set_transfer_context
 
     def delayed(old_indices, layer_idx: int) -> None:
-        time.sleep(rng.uniform(0.0, 0.020))
+        time.sleep(seconds)
         original(old_indices, layer_idx)
 
     communicator.set_transfer_context = delayed
@@ -356,14 +361,40 @@ def test_protocol_rearranges_correctly(seed: int) -> None:
     run_rounds(make_cluster(seed), rounds=3)
 
 
-def test_protocol_under_skew() -> None:
+def transfer_edges(
+    old_indices: torch.Tensor, new_indices: torch.Tensor, num_local_experts: int
+) -> dict[int, dict[int, tuple[list[int], list[int]]]]:
+    """Per layer: expert -> (senders, readers) for every expert that moves."""
+    edges: dict[int, dict[int, tuple[list[int], list[int]]]] = {}
+    for layer, (old, new) in enumerate(zip(old_indices.numpy(), new_indices.numpy())):
+        send_map, recv_map = get_ep_ranks_with_experts_batch(
+            np.unique(new), num_local_experts, old, new
+        )
+        edges[layer] = {e: (send_map[e], r) for e, r in recv_map.items() if r}
+    return edges
+
+
+# Rank 3 starts every layer 20 ms late. Layer 0: rank 3 reads expert 1 from
+# rank 0, so rank 0 waits in execute(0) for rank 3's READ_DONE. Layer 1: rank 1,
+# idle in layer 0, sends expert 2 to rank 0, so its READY(1) reaches rank 0
+# while rank 0 is still draining in generation 0.
+SKEW_OLD_INDICES = torch.tensor([[0, 1, 2, 3, 4, 4, 2, 3], [0, 1, 2, 3, 4, 4, 0, 1]])
+SKEW_NEW_INDICES = torch.tensor([[0, 1, 2, 3, 4, 4, 1, 3], [0, 2, 2, 3, 4, 4, 0, 1]])
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_protocol_under_skew(seed: int) -> None:
+    cluster = make_cluster(seed, num_layers=2, indices=SKEW_OLD_INDICES)
+    assert transfer_edges(SKEW_OLD_INDICES, SKEW_NEW_INDICES, 2) == {
+        0: {1: ([0], [3])},
+        1: {2: ([1], [0])},
+    }, "placement no longer forces an early READY"
     early_ready = [0]
-    for seed in SEEDS:
-        cluster = make_cluster(seed)
-        for rank, communicator in enumerate(cluster.communicators):
-            delay_layer_start(communicator, random.Random(seed * 100 + rank))
-            count_early_ready(communicator._tracker, early_ready)
-        run_rounds(cluster, rounds=3)
+    delay_layer_start(cluster.communicators[3], 0.020)
+    count_early_ready(cluster.communicators[0]._tracker, early_ready)
+    run_rearrangement(cluster, SKEW_NEW_INDICES)
+    verify_cluster(cluster, SKEW_NEW_INDICES)
+    assert_quiescent(cluster, layers_run=2)
     assert early_ready[0] > 0, "no READY arrived before its generation opened"
 
 
