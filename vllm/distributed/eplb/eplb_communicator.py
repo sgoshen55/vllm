@@ -304,6 +304,7 @@ class TorchDistXCCLStagedEplbCommunicator(EplbCommunicator):
 
 
 NIXL_EPLB_PROTOCOL_TIMEOUT_SECONDS = 300.0
+NIXL_EPLB_POLL_INTERVAL_SECONDS = 0.0005
 
 
 def _normalize_nixl_agent_name(agent_name: str | bytes) -> str:
@@ -838,7 +839,7 @@ class NixlEplbCommunicator(EplbCommunicator):
             for handle in completed:
                 pending.remove(handle)
             if pending:
-                time.sleep(0.0005)
+                time.sleep(NIXL_EPLB_POLL_INTERVAL_SECONDS)
 
     def _create_peer_xfer(
         self,
@@ -943,7 +944,7 @@ class NixlEplbCommunicator(EplbCommunicator):
                         f"{len(self._inflight)} READs in flight; "
                         f"READ_DONE missing from {self._tracker.outstanding}"
                     )
-                time.sleep(0.0005)
+                time.sleep(NIXL_EPLB_POLL_INTERVAL_SECONDS)
             self._tracker.end_generation(success=True)
         finally:
             for local_h, remote_h, xfer_h in self._xfer_entries:
