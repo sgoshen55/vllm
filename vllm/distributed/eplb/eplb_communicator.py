@@ -381,8 +381,8 @@ class NixlEplbTransferTracker:
         self.deadline = float("inf")
         # source key -> readers declared in add_send whose READ_DONE is still owed.
         self.outstanding: dict[tuple[int, int, int, int], set[int]] = {}
-        # READY tokens; the value is True once take_ready consumed the token.
-        self.ready: dict[TransferKey, bool] = {}
+        # Missing: no READY yet; False: READY unconsumed; True: taken by take_ready.
+        self.ready_consumed: dict[TransferKey, bool] = {}
 
     def begin_generation(self, generation: int) -> None:
         if self.active_generation is not None:
@@ -415,15 +415,15 @@ class NixlEplbTransferTracker:
         if key.generation <= self.completed_generation:
             raise RuntimeError(f"NIXL EPLB READY for closed generation: key={key}")
         # Held until take_ready; the generation may not have begun yet.
-        self.ready.setdefault(key, False)
+        self.ready_consumed.setdefault(key, False)
 
     def take_ready(self, key: TransferKey) -> bool:
         if key.generation != self.active_generation:
             raise RuntimeError(
                 f"NIXL EPLB take_ready outside the open generation: {key}"
             )
-        if self.ready.get(key) is False:
-            self.ready[key] = True
+        if self.ready_consumed.get(key) is False:
+            self.ready_consumed[key] = True
             return True
         return False
 
@@ -461,7 +461,7 @@ class NixlEplbTransferTracker:
         if success:
             unconsumed = [
                 key
-                for key, consumed in self.ready.items()
+                for key, consumed in self.ready_consumed.items()
                 if key.generation == generation and not consumed
             ]
             if unconsumed:
@@ -471,9 +471,9 @@ class NixlEplbTransferTracker:
         self.completed_generation = generation
         self.active_generation = None
         self.outstanding.clear()
-        self.ready = {
+        self.ready_consumed = {
             key: consumed
-            for key, consumed in self.ready.items()
+            for key, consumed in self.ready_consumed.items()
             if key.generation > generation
         }
 
@@ -670,7 +670,7 @@ class NixlEplbCommunicator(EplbCommunicator):
         assert generation is not None
         key = TransferKey(generation, self._layer_idx, expert_id, src_rank, self._rank)
         self._drain_notifications()
-        if key in self._pending_reads or self._tracker.ready.get(key):
+        if key in self._pending_reads or self._tracker.ready_consumed.get(key):
             raise RuntimeError(f"NIXL EPLB duplicate add_recv: {key}")
         if self._tracker.take_ready(key):
             self._post_read(
