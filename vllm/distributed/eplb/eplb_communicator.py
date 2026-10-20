@@ -614,13 +614,17 @@ class NixlEplbCommunicator(EplbCommunicator):
             "set_transfer_context() must be called before add_send()"
         )
         key = TransferKey(generation, self._layer_idx, expert_id, self._rank, dst_rank)
-        # Register the reader before sending READY: its READ_DONE can only
-        # follow this READY.
-        self._tracker.add_expected_reader(key.source_key, dst_rank)
-        self._nixl_wrapper.send_notif(
-            self._remote_agents[dst_rank],
-            NixlEplbNotification(NixlEplbNotification.READY, key).encode(),
-        )
+        try:
+            # Register the reader before READY: READ_DONE can only follow it
+            self._tracker.add_expected_reader(key.source_key, dst_rank)
+            self._nixl_wrapper.send_notif(
+                self._remote_agents[dst_rank],
+                NixlEplbNotification(NixlEplbNotification.READY, key).encode(),
+            )
+        except Exception:
+            # execute() will not run; clean up here.
+            self._reset_transfer_context()
+            raise
 
     def set_transfer_context(self, old_indices: np.ndarray, layer_idx: int) -> None:
         assert not self._xfer_entries, (
@@ -661,27 +665,35 @@ class NixlEplbCommunicator(EplbCommunicator):
         assert self._expert_to_src_row is not None and self._layer_idx is not None, (
             "set_transfer_context() must be called before add_recv()"
         )
-        local_descs, remote_descs = self._build_read_descs(tensors, src_rank, expert_id)
-        if not self._protocol:
-            # Issue the RDMA READ immediately, overlapping the transfer with
-            # the remaining Python loop in move_to_buffer.
-            self._post_read(src_rank, local_descs, remote_descs, b"")
-            return
-        generation = self._tracker.active_generation
-        assert generation is not None
-        key = TransferKey(generation, self._layer_idx, expert_id, src_rank, self._rank)
-        self._drain_notifications()
-        if key in self._pending_reads or self._tracker.ready_consumed.get(key):
-            raise RuntimeError(f"NIXL EPLB duplicate add_recv: {key}")
-        if self._tracker.take_ready(key):
-            self._post_read(
-                src_rank,
-                local_descs,
-                remote_descs,
-                NixlEplbNotification(NixlEplbNotification.READ_DONE, key).encode(),
+        try:
+            local_descs, remote_descs = self._build_read_descs(
+                tensors, src_rank, expert_id
             )
-        else:
-            self._pending_reads[key] = (local_descs, remote_descs)
+            if not self._protocol:
+                # Issue the RDMA READ immediately, overlapping the transfer
+                # with the remaining Python loop in move_to_buffer.
+                self._post_read(src_rank, local_descs, remote_descs, b"")
+                return
+            generation = self._tracker.active_generation
+            assert generation is not None
+            key = TransferKey(
+                generation, self._layer_idx, expert_id, src_rank, self._rank
+            )
+            self._drain_notifications()
+            if key in self._pending_reads or self._tracker.ready_consumed.get(key):
+                raise RuntimeError(f"NIXL EPLB duplicate add_recv: {key}")
+            if self._tracker.take_ready(key):
+                self._post_read(
+                    src_rank,
+                    local_descs,
+                    remote_descs,
+                    NixlEplbNotification(NixlEplbNotification.READ_DONE, key).encode(),
+                )
+            else:
+                self._pending_reads[key] = (local_descs, remote_descs)
+        except Exception:
+            self._reset_transfer_context()
+            raise
 
     def _build_read_descs(
         self,
@@ -728,8 +740,9 @@ class NixlEplbCommunicator(EplbCommunicator):
         local_h, remote_h, xfer_h = self._create_peer_xfer(
             src, local_descs, remote_descs, notif_msg=notif_msg
         )
-        state = self._nixl_wrapper.transfer(xfer_h)
+        # Append before transfer(): released on failure too.
         self._xfer_entries.append((local_h, remote_h, xfer_h))
+        state = self._nixl_wrapper.transfer(xfer_h)
         if state != "DONE":
             self._inflight.add(xfer_h)
 
@@ -947,20 +960,28 @@ class NixlEplbCommunicator(EplbCommunicator):
                 time.sleep(NIXL_EPLB_POLL_INTERVAL_SECONDS)
             self._tracker.end_generation(success=True)
         finally:
-            for local_h, remote_h, xfer_h in self._xfer_entries:
-                with contextlib.suppress(Exception):
-                    self._nixl_wrapper.release_xfer_handle(xfer_h)
-                with contextlib.suppress(Exception):
-                    self._nixl_wrapper.release_dlist_handle(local_h)
-                with contextlib.suppress(Exception):
-                    self._nixl_wrapper.release_dlist_handle(remote_h)
-            self._xfer_entries.clear()
-            self._inflight.clear()
-            self._pending_reads.clear()
-            self._expert_to_src_row = None
-            self._layer_idx = None
-            if self._protocol and self._tracker.active_generation is not None:
-                self._tracker.end_generation(success=False)
+            # On success the generation is already closed.
+            self._reset_transfer_context()
+
+    def _reset_transfer_context(self) -> None:
+        """Undo set_transfer_context(): release READs, reset layer state,
+        close the generation if open. Idempotent; called by execute() and
+        by add_send()/add_recv() on failure. Cleanup is local only.
+        """
+        for local_h, remote_h, xfer_h in self._xfer_entries:
+            with contextlib.suppress(Exception):
+                self._nixl_wrapper.release_xfer_handle(xfer_h)
+            with contextlib.suppress(Exception):
+                self._nixl_wrapper.release_dlist_handle(local_h)
+            with contextlib.suppress(Exception):
+                self._nixl_wrapper.release_dlist_handle(remote_h)
+        self._xfer_entries.clear()
+        self._inflight.clear()
+        self._pending_reads.clear()
+        self._expert_to_src_row = None
+        self._layer_idx = None
+        if self._protocol and self._tracker.active_generation is not None:
+            self._tracker.end_generation(success=False)
 
     def __del__(self) -> None:
         with contextlib.suppress(Exception):
